@@ -265,6 +265,10 @@ bool SteamControllerLink::steamHaptic(const uint8_t* report, int length, uint64_
         return false;
     }
     std::vector<uint8_t> copy(report, report + length);
+    // Rumble is periodic state and would use up the samples; pulses and commands are the
+    // events worth seeing one by one (a pad click is one 0x82 click command, no stop).
+    if (id != OUT_RUMBLE) logHostReportLocked(report, length, nowMs);
+    if (stopKey(copy) >= 0) m_SummaryStops++;
     if (isBle()) {
         adjustBleHapticLocked(copy);
     }
@@ -363,6 +367,7 @@ void SteamControllerLink::enqueueLocked(std::vector<uint8_t> report, uint64_t no
         // and settings are capped above, so together they always leave room for one more.
         if (victim == m_Outputs.end()) return;
         m_Outputs.erase(victim);
+        m_SummaryEvicted++;
     }
     Output out;
     out.data = std::move(report);
@@ -620,6 +625,12 @@ uint64_t SteamControllerLink::service(uint64_t nowMs)
             lock.lock();
             m_DrainBusy = false;
             if (m_Stopped) return NEVER;
+            if (success) {
+                if (!settings) noteWrittenLocked(report);
+            }
+            else {
+                m_SummaryWriteFailures++;
+            }
             // A disconnect may have queued work for a new controller while this transfer was in
             // flight. Its queue and failure budget belong to it.
             if (m_Generation == generation) {
@@ -673,17 +684,44 @@ uint64_t SteamControllerLink::logSummaryLocked(uint64_t nowMs)
             // What only a Bluetooth LE link does: host settings relayed, haptics rewritten by the knobs.
             snprintf(ble, sizeof(ble), ", host settings %u, adjusted %u", m_SummarySettings, m_SummaryAdjusted);
         }
-        logf(LogInfo, "Steam Controller %s: %u reports/s, pads touched L %s R %s, host haptics: rumble %u, pulse L/R/both %u/%u/%u, command L/R/both %u/%u/%u, other %u%s",
+        logf(LogInfo, "Steam Controller %s: %u reports/s, pads touched L %s R %s, host haptics: rumble %u, pulse L/R/both %u/%u/%u, command L/R/both %u/%u/%u, other %u (%u stops); written: rumble %u, pulse L/R/both %u/%u/%u, command L/R/both %u/%u/%u; write failures %u, evicted %u%s",
              m_Name.c_str(), (unsigned)(m_SummaryReports * 1000 / SUMMARY_MS),
              m_SummaryLeftPad ? "yes" : "no", m_SummaryRightPad ? "yes" : "no",
              m_SummaryRumble, m_SummaryPulse[0], m_SummaryPulse[1], m_SummaryPulse[2],
-             m_SummaryCommand[0], m_SummaryCommand[1], m_SummaryCommand[2], m_SummaryOther, ble);
+             m_SummaryCommand[0], m_SummaryCommand[1], m_SummaryCommand[2], m_SummaryOther, m_SummaryStops,
+             m_SummaryWrittenRumble, m_SummaryWrittenPulse[0], m_SummaryWrittenPulse[1], m_SummaryWrittenPulse[2],
+             m_SummaryWrittenCommand[0], m_SummaryWrittenCommand[1], m_SummaryWrittenCommand[2],
+             m_SummaryWriteFailures, m_SummaryEvicted, ble);
     }
     m_SummaryReports = m_SummaryRumble = m_SummaryOther = m_SummarySettings = m_SummaryAdjusted = 0;
-    for (int i = 0; i < 3; i++) m_SummaryPulse[i] = m_SummaryCommand[i] = 0;
+    m_SummaryStops = m_SummaryEvicted = m_SummaryWriteFailures = m_SummaryWrittenRumble = 0;
+    for (int i = 0; i < 3; i++) m_SummaryPulse[i] = m_SummaryCommand[i] = m_SummaryWrittenPulse[i] = m_SummaryWrittenCommand[i] = 0;
     m_SummaryLeftPad = m_SummaryRightPad = false;
     m_SummaryDueMs = nowMs + SUMMARY_MS;
     return m_SummaryDueMs;
+}
+
+void SteamControllerLink::logHostReportLocked(const uint8_t* report, int length, uint64_t nowMs)
+{
+    if (m_HostSamplesLogged >= HOST_HAPTIC_SAMPLES) return;
+    if (m_HostSamplesLogged == 0) m_FirstHostReportMs = nowMs;
+    char hex[3 * 16 + 1];
+    int n = 0;
+    for (int i = 0; i < length && i < 16; i++) {
+        n += snprintf(hex + n, sizeof(hex) - n, "%s%02x", i ? " " : "", report[i]);
+    }
+    logf(LogInfo, "Steam Controller %s: host haptic report #%u at +%llu ms: %s",
+         m_Name.c_str(), ++m_HostSamplesLogged, (unsigned long long)(nowMs - m_FirstHostReportMs), hex);
+}
+
+void SteamControllerLink::noteWrittenLocked(const std::vector<uint8_t>& report)
+{
+    if (report.empty()) return;
+    if (report[0] == OUT_RUMBLE) m_SummaryWrittenRumble++;
+    else if (report.size() > 1 && report[1] <= 2) {
+        if (report[0] == OUT_PULSE) m_SummaryWrittenPulse[report[1]]++;
+        else if (report[0] == OUT_HAPTIC_COMMAND) m_SummaryWrittenCommand[report[1]]++;
+    }
 }
 
 // ----- stop -----

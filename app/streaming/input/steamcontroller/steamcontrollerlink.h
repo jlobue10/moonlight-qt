@@ -188,6 +188,10 @@ private:
     bool writeOutput(const std::vector<uint8_t>& report);
     static int stopKey(const std::vector<uint8_t>& report);
     uint64_t logSummaryLocked(uint64_t nowMs);
+    // Haptic trace: one line per host pulse/command report for the first HOST_HAPTIC_SAMPLES of a
+    // link, and the per-side written counters the summary sets against what the host sent.
+    void logHostReportLocked(const uint8_t* report, int length, uint64_t nowMs);
+    void noteWrittenLocked(const std::vector<uint8_t>& report);
 
     const int m_Id;
     const SteamHidDeviceInfo m_Info;
@@ -241,6 +245,15 @@ private:
     unsigned m_SummaryPulse[3] = {0, 0, 0}, m_SummaryCommand[3] = {0, 0, 0}, m_SummaryOther = 0;
     unsigned m_SummarySettings = 0, m_SummaryAdjusted = 0;   // BLE: host settings relayed, haptics rewritten by the knobs
     bool m_SummaryLeftPad = false, m_SummaryRightPad = false;
+
+    // Haptic trace (the Android client's fork.98 diagnostics). "host" is what Steam sent through
+    // the stream, "written" what completed on the link; a gap between them is this driver's
+    // (eviction, write failure), none is the host's or the firmware's.
+    static constexpr unsigned HOST_HAPTIC_SAMPLES = 40;
+    unsigned m_HostSamplesLogged = 0;
+    uint64_t m_FirstHostReportMs = 0;
+    unsigned m_SummaryStops = 0, m_SummaryEvicted = 0, m_SummaryWriteFailures = 0;
+    unsigned m_SummaryWrittenRumble = 0, m_SummaryWrittenPulse[3] = {0, 0, 0}, m_SummaryWrittenCommand[3] = {0, 0, 0};
 };
 
 // Enumerates the Steam Controller interfaces (USB cable, puck slots, Bluetooth LE devices), opens

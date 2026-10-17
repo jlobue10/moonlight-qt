@@ -225,12 +225,20 @@ against SDL3's hidapi the opened line also says `, bus bluetooth`.) Then, every 
 something happens:
 
 ```
-Steam Controller USB slot 2: 250 reports/s, pads touched L yes R no, host haptics: rumble 3, pulse L/R/both 12/8/0, command L/R/both 1/1/0, other 0
-Steam Controller Bluetooth LE slot 0: 133 reports/s, pads touched L yes R yes, host haptics: rumble 0, pulse L/R/both 0/23/0, command L/R/both 48/0/0, other 0, host settings 3, adjusted 48
+Steam Controller USB slot 2: 250 reports/s, pads touched L yes R no, host haptics: rumble 3, pulse L/R/both 12/8/0, command L/R/both 1/1/0, other 0 (4 stops); written: rumble 3, pulse L/R/both 12/8/0, command L/R/both 1/1/0; write failures 0, evicted 0
+Steam Controller Bluetooth LE slot 0: 133 reports/s, pads touched L yes R yes, host haptics: rumble 0, pulse L/R/both 0/23/0, command L/R/both 48/0/0, other 0 (0 stops); written: rumble 0, pulse L/R/both 0/23/0, command L/R/both 48/0/0; write failures 0, evicted 0, host settings 3, adjusted 48
 ```
 
-(`host settings` counts the relayed writes, `adjusted` the haptic reports rewritten by the
-Bluetooth LE knobs.) Other lines: `no state report for 3000 ms; controller gone` (a puck slot or
+(`host haptics` is what Steam sent through the stream, `written` what completed on the link,
+`host settings` counts the relayed writes, `adjusted` the haptic reports rewritten by the
+Bluetooth LE knobs.) The first 40 host pulse and command reports of a link are also logged one
+by one, `host haptic report #n at +t ms: 82 00 02 f2` (side 0 = left pad, 1 = right, 2 = both;
+Steam's pad click is one `82 <side> 02 f2` click command at -14 dB, a finger sliding over a pad
+single 400 us pulses `81 <side> 90 01 00 00 01 00`, and `81 <side> 00 ..` a stop). A click that
+was felt on one pad but not the other reads off these lines: no `82 0x 02 f2` for it means the
+host did not generate it (the click bit never reached Steam, or Steam's per-controller haptic
+settings for the virtual unit); `host` and `written` apart means this driver lost it (`evicted`,
+`write failures`); both present and nothing felt is the firmware or the pad. Other lines: `no state report for 3000 ms; controller gone` (a puck slot or
 a Bluetooth controller went to sleep or out of range), `output failed on interface N (1 of 3)` /
 `output failed on Bluetooth LE slot N (1 of 3)` / `retiring the slot` (writes failing; the slot
 is retried after a second), `link settings ... -> write failed` (the feature report was refused;
