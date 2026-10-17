@@ -1854,7 +1854,7 @@ Flickable {
                     ToolTip.delay: 1000
                     ToolTip.timeout: 10000
                     ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Evens out when frames are displayed, including games whose frame rate does not divide the host display's refresh rate. Adds up to a few milliseconds of delay only while uneven frames need it. Does not blend images or eliminate game stalls.") + "\n\n" +
+                    ToolTip.text: qsTr("Leaves source frame-time variation within your tolerance unchanged. Corrects only the excess, with a total timing adjustment of at most one tolerance. Absorb microstutter allows more smoothing and delay. Does not blend images or eliminate game stalls.") + "\n\n" +
                                   qsTr("Reconnect the stream after changing this setting.")
                 }
 

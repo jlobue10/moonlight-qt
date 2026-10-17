@@ -65,6 +65,7 @@ typedef struct _VIDEO_STATS {
     uint64_t vrrGuardUs;
     uint64_t vrrSourcePeriodUs;
     uint64_t vrrAppliedBufferUs, vrrBufferCapUs, vrrGpuReadinessLeadUs;
+    uint64_t vrrAppliedSmoothingUs;
     uint16_t minHostProcessingLatency;         // low-res from RTP
     uint16_t maxHostProcessingLatency;         // low-res from RTP
     uint32_t totalHostProcessingLatency;       // low-res from RTP

@@ -34,6 +34,9 @@ public:
     static constexpr uint64_t MinimumDrainPerMille = 5;
     struct Stats {
         uint64_t nominalUs = 0, existingUs = 0, targetUs = 0, addedUs = 0;
+        // Recovery's requested phase before this frame's readiness bound.
+        // Diagnostic only: current input lateness is not recovery demand.
+        uint64_t requestedTargetUs = 0;
         uint64_t carryUs = 0, minimumIntervalUs = 0, physicalPeriodUs = 0;
         uint64_t allowanceUs = 0, intendedIntervalUs = 0;
         uint64_t plans = 0, limited = 0, resets = 0, resyncDrops = 0, deferred = 0, capped = 0;
@@ -42,11 +45,12 @@ public:
     Stats plan(uint64_t frame, uint64_t intendedSlot, uint64_t nominal,
                uint64_t existing, uint64_t readyBound, uint64_t physicalPeriod,
                uint64_t ownershipFloor, uint64_t allowance, uint64_t sourcePeriod,
-               bool valid) {
+               bool valid, uint64_t carryLimit = 0) {
         ++m_Stats.plans;
         m_Stats.nominalUs = nominal;
         m_Stats.existingUs = existing;
         m_Stats.targetUs = std::max(existing, ownershipFloor);
+        m_Stats.requestedTargetUs = std::max(nominal, ownershipFloor);
         m_Stats.physicalPeriodUs = physicalPeriod;
         m_Stats.allowanceUs = allowance;
         m_Stats.intendedIntervalUs = 0;
@@ -65,9 +69,12 @@ public:
             m_Stats.minimumIntervalUs = std::max(physicalPeriod,
                 interval > drain ? interval - drain : 0);
             const uint64_t phaseFloor = add(m_Anchor, m_Stats.minimumIntervalUs);
-            const uint64_t carryCeiling = add(nominal, sourcePeriod ? sourcePeriod : physicalPeriod);
+            const uint64_t period = sourcePeriod ? sourcePeriod : physicalPeriod;
+            const uint64_t carryCeiling = add(nominal, carryLimit ? std::min(carryLimit, period) : period);
             if (phaseFloor > carryCeiling) ++m_Stats.capped;
             m_Stats.targetUs = std::max(m_Stats.targetUs, std::min(phaseFloor, carryCeiling));
+            m_Stats.requestedTargetUs = std::max(m_Stats.requestedTargetUs,
+                                                std::min(phaseFloor, carryCeiling));
         }
         m_PlannedFrame = frame;
         m_PlannedNominal = nominal;
@@ -112,6 +119,14 @@ public:
         m_HaveAnchor = true;
     }
     void noteResyncDrop() { ++m_Stats.resyncDrops; breakSequence(); }
+    // The shared buffer budget can restrict intentional recovery after plan().
+    // Commit must anchor the plan that will actually be submitted.
+    void applyTargetLimit(uint64_t target, uint64_t requested) {
+        m_PlannedTarget = m_Stats.targetUs = target;
+        m_Stats.requestedTargetUs = requested;
+        m_Stats.addedUs = target - std::min(target, m_Stats.existingUs);
+        m_Stats.carryUs = target - std::min(target, m_Stats.nominalUs);
+    }
     void noteDeferred() { ++m_Stats.deferred; }
     void breakSequence() {
         if (m_HaveAnchor) ++m_Stats.resets;

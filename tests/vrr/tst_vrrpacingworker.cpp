@@ -230,6 +230,8 @@ void testPreparedFramesOverlapAndTrace()
     expect(backend.stopped && first.releases == 1 && second.releases == 1 && pending.releases == 1,
            "prepared-frame shutdown must stop preparation and release each image exactly once");
     const auto graph = telemetry.timingGraphSnapshot().points;
+    expect(!graph.empty() && graph.back().extraDelayUs == telemetryStats(telemetry).vrrAppliedSmoothingUs,
+           "frametime and stats must publish the same frame's planned extra phase");
     expect(graph.size() == 2 && graph[0].targetUs && graph[0].submissionUs &&
                graph[1].targetUs && graph[1].submissionUs,
            "normal prepared presentations must publish individual target and submission observations for live stats");
@@ -3503,7 +3505,7 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
            "captured calibration must restore prior history without inventing fresh successes");
     expect(fields.value(columns.indexOf("param_playout_prediction_only")) == "1" &&
                fields.value(columns.indexOf("param_playout_responsive_buffer")) == "12" &&
-               fields.value(columns.indexOf("param_playout_smoothing_windowed_cadence")) == "5" &&
+               fields.value(columns.indexOf("param_playout_smoothing_windowed_cadence")) == "4" &&
                fields.value(columns.indexOf("param_playout_native_hitch_adaptation")) == "0",
            "capture must identify production interval-quality adaptation for exact replay");
     expect(header.contains("frame_receive_us") &&

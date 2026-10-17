@@ -1113,25 +1113,27 @@ must still pass before treating a capture as an A/B reference. The replay's
 explicitly set both parameters above to zero to evaluate timestamp-following
 candidates.
 
-With smoothing enabled, production uses the gain smoother: it advances by a
-tracked source period and pulls 15 percent toward the mapped timestamp slot,
-with a 2.5-percent period EMA plus 2-percent phase-error period feedback
-(`playout_smoothing_period_feedback_per_million=20000`) and a 6 ms positive
-adjustment cap. A learned readiness reserve
-(`playout_smoothing_reserve_*`: at most 3 ms, p98, 0.5 ms tolerance, 0.5 ms/s
-release) delays the smoothed schedule by the recent lateness the smoother itself
-caused by moving frames before their raw slots; delivery that misses the raw
-slot remains playout-buffer evidence. The reserve is included in
-`cadence_smoothing_us`, never in `playout_delay_us`. Captures without these
-fields replay with them disabled. The caps do not bound total client latency.
-The metronome remains disabled. The production controller tests cover
-approximately 77 FPS host jitter in all three timing presets, smoothing off/on,
-a host stall, a late wake, and a change to 60 FPS; 90 FPS quantized to a 120 Hz
-host with normal and tight buffers; even stamps with delivery spikes, which must
-not acquire a reserve; reserve release after pacing becomes even; and a 70-100
-FPS rate ramp. `configs/judder-reserve-variants.json` compares the session
-policy with the previous 2 ms policy, each new control removed, alternative
-tolerances and caps, and Reduce judder off in one batch.
+With Reduce judder enabled, production selects source-gap revision 4. The
+resolved preset/custom tolerance T is both the untouched source-gap band and
+the shared retained phase limit. Correct only error beyond T, by at most T per
+gap, retaining phase within [-T,+T]. Gaps within T retain the previous phase so
+their spacing is unchanged. There is no standing smoothing reserve, period
+blending or recentering. Source/cadence resets clear the phase. Known readiness,
+input buffering, display spacing and late recovery can still constrain actual
+presentation independently; T does not cap total client latency.
+
+`tst_sourcegapsmoothing` exercises the actual production session policy, with
+below/at/above-T RTP boundaries, consecutive excess gaps, clean gaps after a
+correction, changing decode/network readiness, preset/custom tolerances and
+native/worker selection. Recorded revision-4 and revision-5 policies remain
+explicitly selectable for their historical fixtures and exact replay.
+
+The separately enabled Absorb microstutter option selects revision-6 local
+cadence tracking around the gain smoother, with its wider learned reserve
+(at most 5 ms at p99.5) and 8 ms lag.
+Historical gain/reserve tests explicitly select the recorded policy. Reserve
+and retiming are recorded in `cadence_smoothing_us`, separately from
+`playout_delay_us`; captures retain their own resolved parameter snapshots.
 
 The retired metronome policy is available for replay with
 `controller.timestamp_playout_enabled` and
@@ -1802,3 +1804,126 @@ blocked renderer and on minimize, with exact decoded-frame release.
 without changing renderer selection. The experimental checkbox is removed.
 A subsequent live comparison is still needed to validate driver behavior,
 resizing, stop/reconnect, tearing and visible pacing.
+
+Preventable input-hitch goal (2026-10-16): `playout_input_hitch_misses_only=8`
+is selected by new adaptive-input sessions. Recorded policies 0--7 retain their
+behavior. Revision 8 requires evidence of a substantial rate transition against
+both the layer anchor and the current operating cadence. Three consistent
+adjacent intervals at least 1.5x apart qualify a clear step; a gradual large
+change needs 12 tightly clustered intervals spanning at least 200 ms and
+agreement with the source fit. Ordinary movement of the fitted period cannot
+switch layers by itself. The tests reproduce policy 7's false switch and lost
+coverage from the reported short RTP pattern, then reject it under policy 8.
+They also cover genuine 90/30/90 restoration, repeated brief return visits,
+isolated gaps, skipped identities, sustained gradual changes, and variable
+output that crosses the old anchor without settling to a distinct rate.
+
+Policy 8 reports actual eligible coverage across all layers in the selected
+trailing window, independently of each layer's adaptation history. Tests cover
+invalid input exclusion, retaining real misses when the new layer has no
+samples, the resulting overlay percentage, expiration and session reset.
+Within a layer it retains gradual growth and bounded healthy release probes,
+and removes the repeated post-drop target-snap window. Plateau release and
+shared per-interval release budgets remain covered. These are deterministic
+regressions; trace replay simulations and live display validation are deferred.
+A raw input overrun scores only when
+it caused a source-matched interval stretch beyond tolerance, attributed to
+that frame's readiness, with qualified capacity and room within the selected
+maximum. Clean late inputs and compressed successors do not add failures;
+unprotectable overruns are excluded rather than counted as clean. A quantile
+above the current buffer cannot authorize growth while this actual miss goal
+is met. Historical absent/zero parameters preserve old raw-input scoring.
+`tst_inputpercentileintegration` covers clean late input versus identical input
+that causes real hitches, preventability limits, below-goal growth, above-goal
+restraint and legacy behavior. Replay-config tests cover the flag's production
+selection, range validation, serialization and historical zero default.
+
+Coverage protection regression (2026-10-16): policy 2 adds a miss-backed target
+floor while below the selected coverage goal. `testMissProtectionSurvivesQuantileTrim`
+reproduces a real startup hitch being discarded by raw-input trimming, and checks
+that later harmless late frames neither erase nor inflate its protection. Policy
+1 retains its earlier behavior for exact replay; policy 0 is historical raw-input
+coverage. Policy 6 retains these rules, with its own calibration identity.
+The mature-miss attack regression checks that an in-budget miss does not grow
+protection, a goal-breaking miss retains only the justified quantile up to its
+measured requirement, and a later harmless late input cannot trigger an attack.
+
+Rate-transition protection regression (2026-10-16): recorded policy 6
+translates applied protection using actual mapping movement during qualified
+rate-rise settling. History's drift-normalized coordinate remains separate.
+`testLiveMappingIsSeparateFromHistoryDrift` verifies the distinction, deadline
+preservation, no duplicate movement and safe signed/bounded arithmetic.
+`testRateBaselineStepIsNotClockDrift` reproduces the old fitter treating an 8 ms
+rate-dependent baseline step as clock skew, and checks steady fitting resumes
+correctly with both signs of real clock drift. Intermediate policies 3--5 remain
+replayable. Their projection and coverage-guard fixtures remain compatibility
+checks; the mapping regression remains pinned to policy 6, with the current
+layer transition behavior covered separately under policy 8.
+
+
+Extra-delay phase accounting (2026-10-16): `extraDelayDoesNotChaseCurrentReadiness`
+reproduces constant retained recovery with alternating current readiness. The
+reported phase stays constant while actual readiness-bounded targets retain
+their existing behavior; a newly late input itself adds no reported recovery.
+The worker integration checks that frametime and stats publish the same value.
+Replay exposes the requested phase via `planned_extra_delay_us` and
+`simulated_planned_extra_delay_us`; historical `pacer_delay_us` remains the old
+marginal-wait measure for comparisons.
+
+Absorb revision 6 qualifies four uniform valid source gaps within T of their
+mean independently of the longer rate fit. The controller suite reproduces a
+uniform 80-to-116 FPS transition and checks quantized 90-on-120 capture,
+alternating 9/17 ms gaps, 20/30/90/116 FPS steps and 70--100 FPS ramps across
+all presets. Assertions bound jerk, latency, retiming and reserve. Reset phase
+release is at most min(1 ms,T/2) per frame; ordinary Reduce judder stays revision
+4, and explicit historical revisions remain covered.
+
+
+### Tolerance-limited buffer regression build (input policy 9)
+
+`inputpercentileintegration` covers the 30 FPS layer-separation gate, real fast
+90/30/90 returns, upward-only restoration, T/frame downward draining, small
+changes at T/s, shrinking maximums, bounded release trials, stale-miss recovery,
+and a shared allowance for input, smoothing, and recovery. The policy-7 and -8
+fixtures remain explicit historical comparisons. `sourcegapsmoothing` additionally
+checks the fixed 2T Absorb pad and the combined live-controller movement limit
+with changing source intervals. Revision 7 removes the learned Absorb reserve.
+Physical readiness and ownership remain independent mandatory floors; no test
+should require a frame to be submitted before those floors. The requested phase
+must continue to exclude current input readiness so late inputs remain visible.
+
+Local test-build artifacts and logs are under `build/buffer-rate-fix/`. These are
+deterministic contract checks, not trace replay or proof of displayed fluidity.
+The user has deferred replay simulations for this iteration.
+
+### Layer decreases use normal release (input policy 10)
+
+Policy 10 preserves the confirmed layer-selection rework, upward learned-buffer
+restoration and continuous history, while restoring normal continuous input
+release. `inputpercentileintegration` compares healthy release and targets with
+policy 8 at 30/120 FPS, checks ordinary downward-layer release against the same
+code at steady rate, upward-only jumps, small normal growth, shared per-interval
+allowances, fresh-miss interruption and input/extra-delay independence. Policy 9
+fixtures retain its historical slow trials and T/frame layer drain. Live-controller
+round trips cover policy 10 with smoothing on and off. Replay configuration
+round-trips policies 9 and 10 and rejects unsupported versions.
+
+Coverage reporting has a separate 10 s window alongside the selected learning
+history. Tests cover fresh misses, expiry, invalid and stale callbacks, no fake
+success during idle spans, and session resets. Overlay fit fixtures exercise the
+recent and full-history scores together at Deck and 4K sizes. Artifacts for this
+correction are under `build/layer-drain-correction/`. Deterministic checks do not
+establish physical display smoothness.
+
+### Stable learned target with current miss scoring
+
+`playout_input_stable_adaptation=1` restores the long-window target and configured
+250 us/s release without speculative release probes. It does not alter input
+eligibility or same-frame preventable-hitch attribution. Focused integration
+checks cover a clean-but-late input plateau, exclusion beyond the buffer maximum,
+normal bounded growth on actual qualifying misses, invalid input, ordinary
+lower-layer drain and immediate upward learned-layer restoration. Replay config
+checks require old snapshots to default the flag to zero and reject values above
+one. The final comparison and stress artifacts are under
+`build/stable-buffer-recovery-20261017/`; rejected timing-recovery experiments
+are retained separately from the selected candidate.

@@ -30,10 +30,16 @@ public:
             last = text;
             height = surface ? surface->h : 0;
             width = surface ? surface->w : 0;
+            bottomTransparent = false;
+            statsInk = statsShadow = 0;
             colors = {};
             rowColors = {};
             minInkY.fill(std::numeric_limits<int>::max()); maxInkY.fill(-1);
             if (surface && surface->format->format == SDL_PIXELFORMAT_ARGB8888) {
+                const auto* bottom = reinterpret_cast<const Uint32*>(static_cast<const Uint8*>(surface->pixels) + (surface->h - 1) * surface->pitch);
+                Uint8 r, g, b, a;
+                SDL_GetRGBA(bottom[surface->w - 1], surface->format, &r, &g, &b, &a);
+                bottomTransparent = a == 0;
                 // Cadence, clipped spikes, incoming stages and buffer inks.
                 const std::array<Uint32, 10> palette{
                     SDL_MapRGBA(surface->format, 190, 198, 210, 255),
@@ -50,7 +56,9 @@ public:
                 const auto S = [scale](int v) { return int(std::lround(v * scale)); };
                 for (int y = 0; y < surface->h; ++y) {
                     const auto row = reinterpret_cast<const Uint32*>(static_cast<const Uint8*>(surface->pixels) + y * surface->pitch);
-                    for (int x = 0; x < surface->w; ++x)
+                    for (int x = 0; x < surface->w; ++x) {
+                        statsInk += row[x] == SDL_MapRGBA(surface->format, 212, 255, 0, 255);
+                        statsShadow += row[x] == SDL_MapRGBA(surface->format, 0, 0, 0, 255);
                         for (size_t k = 0; k < palette.size(); ++k) {
                             colors[k] += row[x] == palette[k];
                             for (int graphRow = 0; graphRow <= TimingGraphLayout::BufferLane; ++graphRow) {
@@ -62,9 +70,21 @@ public:
                                 }
                             }
                         }
+                    }
                 }
                 const auto preview = qEnvironmentVariable("MOONLIGHT_OVERLAY_TEST_PREVIEW");
-                if (!preview.isEmpty()) assert(SDL_SaveBMP(surface, qPrintable(preview)) == 0);
+                if (!preview.isEmpty()) {
+                    assert(SDL_SaveBMP(surface, qPrintable(preview)) == 0);
+                    // Inspect the real alpha composition over bright video,
+                    // not a transparent surface implicitly viewed on black.
+                    auto* bright = SDL_CreateRGBSurfaceWithFormat(0, surface->w, surface->h, 32, SDL_PIXELFORMAT_ARGB8888);
+                    assert(bright);
+                    SDL_FillRect(bright, nullptr, SDL_MapRGBA(bright->format, 255, 255, 255, 255));
+                    SDL_SetSurfaceBlendMode(surface, SDL_BLENDMODE_BLEND);
+                    assert(SDL_BlitSurface(surface, nullptr, bright, nullptr) == 0);
+                    assert(SDL_SaveBMP(bright, qPrintable(preview + ".bright.bmp")) == 0);
+                    SDL_FreeSurface(bright);
+                }
             }
         }
         SDL_FreeSurface(surface);
@@ -88,8 +108,8 @@ public:
     const std::thread::id producer = std::this_thread::get_id();
     std::mutex lock;
     std::condition_variable ready;
-    bool block = false, entered = false;
-    unsigned calls = 0;
+    bool block = false, entered = false, bottomTransparent = false;
+    unsigned calls = 0, statsInk = 0, statsShadow = 0;
     std::string last;
     int height = 0, width = 0;
     std::array<unsigned, 10> colors{};
@@ -107,6 +127,7 @@ static TimingGraphSnapshot testTimingGraph()
     in.submitted = true; in.idValid = true; in.backend = 2;
     in.submissionUs = in.targetUs = 1000000; in.sourcePeriodUs = 10000;
     in.bufferUs = in.requestedBufferUs = 2500; in.toleranceUs = 500;
+    in.extraDelayUs = 1250;
     in.submissionId = UINT64_MAX - 1000; // Preserve full-width identity.
     history.record(in);
     const auto firstId = in.submissionId;
@@ -116,6 +137,10 @@ static TimingGraphSnapshot testTimingGraph()
     history.copyTo(snapshot);
     assert(points.size() == 2 && points[0].displayUs == 1002000 && points[1].displayUs == 0);
     assert(points[1].submissionIntervalUs == 12000 && points[1].targetIntervalUs == 10000);
+    assert(points[1].extraDelayUs == 1250 && points[1].bufferUs == 2500);
+    // Extra holds never enlarge the buffer or the stage miss threshold.
+    auto noExtra = points[1]; noExtra.extraDelayUs = 0;
+    assert(bufferGraphSample(noExtra).bufferLimitUs == bufferGraphSample(points[1]).bufferLimitUs);
     // Invalid samples, duplicate feedback, and pre-submission timestamps must
     // never become new display events or attach to the reporting frame.
     in.submitted = false; in.displayUs = 1003000; history.record(in);
@@ -204,14 +229,14 @@ static void testAdaptiveProducerCoverage()
     in.networkReadyUs=1000500; in.decoderOutputUs=1008000; in.decoderReadyUs=1009000;
     in.inputPercentileEnabled=true; in.producerEligible=true; in.producerRequiredUs=2000; in.inputToleranceUs=750;
     in.inputTargetUs=1500; in.inputTargetValid=true; in.inputTargetCapped=true;
-    in.inputProbabilityPpm=995000; in.inputWindowUs=200000000;
+    in.inputProbabilityPpm=995000; in.inputWindowUs=200000000; in.inputCoverageWindowUs=10000000;
     in.inputSamples=301; in.inputAbsorbed=297; in.inputMissed=4; in.trajectoryCarryUs=6690;
     history.record(in); TimingGraphSnapshot snapshot; history.copyTo(snapshot);
     assert(snapshot.points.size()==1);
     const auto& p=snapshot.points[0];
     assert(p.producerRequiredUs==in.producerRequiredUs && p.producerEligible && p.inputPercentileEnabled);
     assert(p.inputTargetUs==1500 && p.inputTargetUs!=p.bufferUs && p.inputTargetUs!=p.requestedBufferUs);
-    assert(p.inputTargetValid && p.inputTargetCapped && p.inputProbabilityPpm==995000 && p.inputWindowUs==200000000 && p.inputToleranceUs==750);
+    assert(p.inputTargetValid && p.inputTargetCapped && p.inputProbabilityPpm==995000 && p.inputWindowUs==200000000 && p.inputCoverageWindowUs==10000000 && p.inputToleranceUs==750);
     assert(p.inputSamples==301 && p.inputAbsorbed==297 && p.inputMissed==4 && p.trajectoryCarryUs==6690);
     auto sample=bufferGraphSample(p);
     assert(sample.producerAbsorbed() && !sample.producerMissed());
@@ -851,10 +876,13 @@ int main(int argc, char** argv)
                     "Incoming smoothness (host): 99.50%\n";
                 PerformanceStats::Snapshot summary;
                 summary.vrr = summary.adaptive = true; summary.bufferUs = 5700;
+                summary.smoothingUs = 1250;
                 summary.targetPpm = 999500; summary.toleranceUs = 500;
                 summary.nowUs = 5000000; summary.input.samples = summary.input.recentEligible = 22000;
                 summary.input.recentMissed = 11; summary.input.targetUs = 5420; summary.input.windowUs = 300000000;
                 summary.input.tailUncertain = false;
+                summary.input.reportingWindowUs=10000000;summary.input.reportingEligible=1100;
+                summary.input.reportingAbsorbed=20;summary.input.reportingMissed=2;
                 auto coherent = adaptiveGraph(6959, true, true);
                 Vrr13::PresentTiming matchedDisplay;
                 BufferHitchHistory stageHistory;
@@ -867,13 +895,15 @@ int main(int argc, char** argv)
                     point.networkReadyUs = point.sourceTimeUs + 500;
                     point.decoderOutputUs = point.sourceTimeUs + 8000;
                     point.decoderReadyUs = point.sourceTimeUs + 9000;
-                    point.bufferUs = summary.bufferUs; point.inputTargetUs = summary.input.targetUs;
+                    point.bufferUs = summary.bufferUs; point.extraDelayUs = summary.smoothingUs;
+                    point.inputTargetUs = summary.input.targetUs;
                     point.toleranceUs = point.inputToleranceUs = summary.toleranceUs;
                     point.inputVrrHeadroomUs = 760;
                     point.inputProbabilityPpm = summary.targetPpm; point.inputWindowUs = summary.input.windowUs;
-                    point.inputSamples = summary.input.recentEligible;
-                    point.inputAbsorbed = summary.input.recentAbsorbed;
-                    point.inputMissed = summary.input.recentMissed;
+                    point.inputCoverageWindowUs = summary.input.reportingWindowUs;
+                    point.inputSamples = summary.input.reportingEligible;
+                    point.inputAbsorbed = summary.input.reportingAbsorbed;
+                    point.inputMissed = summary.input.reportingMissed;
                     // Actual synthetic display identities drive both the plot
                     // and the summary observer; neither uses input coverage.
                     if (i >= 19) {
@@ -901,9 +931,10 @@ int main(int argc, char** argv)
                 replacement.awaitText(text);
                 std::lock_guard<std::mutex> guard(replacement.lock);
                 assert(replacement.width <= width && replacement.height <= height);
-                assert(replacement.height >= (fourK ? 678 : TimingGraphLayout::Height));
-                if (graphOnly) assert(replacement.height == (fourK ? 679 : TimingGraphLayout::Height));
-                else assert(replacement.height > (fourK ? 679 : TimingGraphLayout::Height));
+                if (!graphOnly) assert(replacement.bottomTransparent && replacement.statsInk > 0 && replacement.statsShadow > 0);
+                assert(replacement.height >= (fourK ? 704 : TimingGraphLayout::Height));
+                if (graphOnly) assert(replacement.height == (fourK ? 705 : TimingGraphLayout::Height));
+                else assert(replacement.height > (fourK ? 705 : TimingGraphLayout::Height));
                 std::cout << "Readability " << name << ": " << replacement.width << "x" << replacement.height
                           << " fits " << width << "x" << height << "\n";
             }
@@ -1005,12 +1036,24 @@ int main(int argc, char** argv)
             // text string read alongside an earlier hide notification.
             std::unique_lock<std::mutex> guard(replacement.lock);
             assert(replacement.ready.wait_for(guard, 3s, [&] {
-                return replacement.last == "Stats only" && replacement.height > 0 &&
+                return replacement.last == "Stats only" && replacement.bottomTransparent && replacement.height > 0 &&
                     replacement.height < TimingGraphLayout::Height;
             }));
             for (const auto& row : replacement.rowColors)
                 for (auto count : row) assert(count == 0);
         }
+        // A row longer than the wrap width must retain its shadow instead of
+        // triggering the old unoutlined fallback for the whole stats block.
+        const std::string wrapped = "Wrapped stats: " + std::string(150, 'M') + " end";
+        if (!previewFolder.isEmpty()) qputenv("MOONLIGHT_OVERLAY_TEST_PREVIEW", qPrintable(previewFolder + "/wrapped-stats.bmp"));
+        manager.updateOverlayText(OverlayDebug, wrapped.c_str());
+        replacement.awaitText(wrapped);
+        {
+            std::lock_guard<std::mutex> guard(replacement.lock);
+            assert(replacement.height > manager.getOverlayFontSize(OverlayDebug) * 2);
+            assert(replacement.bottomTransparent && replacement.statsInk > 0 && replacement.statsShadow > 0);
+        }
+        qunsetenv("MOONLIGHT_OVERLAY_TEST_PREVIEW");
         manager.setOverlayState(OverlayDebug, false);
         manager.updateOverlayText(OverlayDebug, "hidden");
         replacement.awaitText("hidden"); // Updating disabled text cannot cancel the hide request.

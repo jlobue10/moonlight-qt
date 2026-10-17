@@ -1022,6 +1022,7 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
         dst.vrrGuardUs = src.vrrGuardUs;
         dst.vrrSourcePeriodUs = src.vrrSourcePeriodUs;
         dst.vrrAppliedBufferUs = src.vrrAppliedBufferUs;
+        dst.vrrAppliedSmoothingUs = src.vrrAppliedSmoothingUs;
         dst.vrrBufferCapUs = src.vrrBufferCapUs;
         dst.vrrGpuReadinessLeadUs = src.vrrGpuReadinessLeadUs;
         dst.vrrPrepareLatenessP50Us = src.vrrPrepareLatenessP50Us;
@@ -1181,6 +1182,7 @@ void FFmpegVideoDecoder::syncPacerTelemetry()
         m_ActiveWndVideoStats.vrrGuardUs = snapshot.vrrGuardUs;
         m_ActiveWndVideoStats.vrrSourcePeriodUs = snapshot.vrrSourcePeriodUs;
         m_ActiveWndVideoStats.vrrAppliedBufferUs = snapshot.vrrAppliedBufferUs;
+        m_ActiveWndVideoStats.vrrAppliedSmoothingUs = snapshot.vrrAppliedSmoothingUs;
         m_ActiveWndVideoStats.vrrBufferCapUs = snapshot.vrrBufferCapUs;
         m_ActiveWndVideoStats.vrrGpuReadinessLeadUs = snapshot.vrrGpuReadinessLeadUs;
         m_ActiveWndVideoStats.vrrPrepareLatenessP50Us =
@@ -1462,6 +1464,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
             vrr.adaptive = interval.inputPercentileEnabled;
             vrr.atLimit = stats.vrrBufferAtLimit;
             vrr.bufferUs = stats.vrrAppliedBufferUs;
+            vrr.smoothingUs = stats.vrrAppliedSmoothingUs;
             vrr.targetPpm = stats.vrrOnTimeTargetPerMillion;
             vrr.toleranceUs = interval.toleranceUs;
             vrr.nowUs = LiGetMicroseconds();

@@ -34,6 +34,40 @@ SDL_Surface* fitToOutput(SDL_Surface* surface, int width, int height)
     return fitted;
 }
 
+// Wrap both masks with the same unoutlined font so long rows retain their
+// letter shadows. Only glyphs and their narrow shadows cover the video.
+SDL_Surface* renderStatsText(TTF_Font* font, const char* text, SDL_Color color, double scale)
+{
+    const int oldOutline = TTF_GetFontOutline(font);
+    TTF_SetFontOutline(font, 0);
+    const int wrap = int(std::lround(1024 * scale));
+    auto* face = TTF_RenderUTF8_Blended_Wrapped(font, text, color, wrap);
+    auto* shadow = TTF_RenderUTF8_Blended_Wrapped(font, text, {0, 0, 0, 255}, wrap);
+    TTF_SetFontOutline(font, oldOutline);
+    if (!face || !shadow) {
+        SDL_FreeSurface(face); SDL_FreeSurface(shadow);
+        return nullptr;
+    }
+    const int stroke = std::max(1, int(std::lround(scale)));
+    const int offset = std::max(2, int(std::lround(2 * scale)));
+    auto* surface = SDL_CreateRGBSurfaceWithFormat(0, face->w + 2 * stroke + offset,
+        face->h + 2 * stroke + offset, 32, SDL_PIXELFORMAT_ARGB8888);
+    if (surface) {
+        SDL_FillRect(surface, nullptr, 0);
+        const auto stamp = [&](SDL_Surface* mask, int x, int y) {
+            SDL_Rect at{x, y, mask->w, mask->h};
+            SDL_BlitSurface(mask, nullptr, surface, &at);
+        };
+        stamp(shadow, stroke + offset, stroke + offset);
+        for (int y = -stroke; y <= stroke; y += stroke)
+            for (int x = -stroke; x <= stroke; x += stroke)
+                if (x || y) stamp(shadow, stroke + x, stroke + y);
+        stamp(face, stroke, stroke);
+    }
+    SDL_FreeSurface(face); SDL_FreeSurface(shadow);
+    return surface;
+}
+
 // CPU rasterization runs on the overlay worker. All backends receive the same
 // composed surface through their current overlay upload path; no GPU API work
 // or text rendering happens on the frame path.
@@ -285,6 +319,10 @@ SDL_Surface* composeTimingGraph(TTF_Font* font, SDL_Surface* text, const TimingG
         (adaptiveInput ? latestPoint.inputTargetUs : latestPoint.requestedBufferUs) / 1000.0,
         adaptiveInput && !latestPoint.inputTargetValid ? " (learning/unknown)" : "",
         latestPoint.inputTargetCapped ? " (capped)" : "");
+    label(caption, left, height - S(180), labelColor);
+    std::snprintf(caption, sizeof(caption), "Extra delay %.2f ms | Planned total %.2f ms",
+        latestPoint.extraDelayUs / 1000.0,
+        (latestPoint.bufferUs + latestPoint.extraDelayUs) / 1000.0);
     label(caption, left, height - S(160), labelColor);
     if (adaptiveInput) {
         std::snprintf(caption, sizeof(caption), "Tolerance %.2f ms | Dashed buffer + tolerance %.2f ms",
@@ -300,8 +338,9 @@ SDL_Surface* composeTimingGraph(TTF_Font* font, SDL_Surface* text, const TimingG
             std::snprintf(coverage, sizeof(coverage), "%.2f%%",
                 100.0 * (latestPoint.inputSamples - std::min(latestPoint.inputSamples, latestPoint.inputMissed)) / latestPoint.inputSamples);
         else std::snprintf(coverage, sizeof(coverage), "N/A");
-        std::snprintf(caption, sizeof(caption), "Coverage %s | frames %llu | absorbed %llu | misses %llu",
-            coverage,
+        std::snprintf(caption, sizeof(caption), "Coverage (%llus) %s | frames %llu | absorbed %llu | misses %llu",
+            static_cast<unsigned long long>((latestPoint.inputCoverageWindowUs ?
+                latestPoint.inputCoverageWindowUs : latestPoint.inputWindowUs) / 1000000), coverage,
             static_cast<unsigned long long>(latestPoint.inputSamples),
             static_cast<unsigned long long>(latestPoint.inputAbsorbed),
             static_cast<unsigned long long>(latestPoint.inputMissed));
@@ -317,13 +356,13 @@ SDL_Surface* composeTimingGraph(TTF_Font* font, SDL_Surface* text, const TimingG
         hitches.observedFrames ? hitches.measuredFrames * 100.0 / hitches.observedFrames : 0.0);
     label(caption, left, height - S(60), labelColor);
     if (adaptiveInput && latestPoint.inputVrrHeadroomUs) {
-        std::snprintf(caption, sizeof(caption), "VRR recovery credit %.2f ms; red X beyond buffer + tolerance",
+        std::snprintf(caption, sizeof(caption), "VRR credit %.2f ms | Red X: beyond buffer + tolerance",
             latestPoint.inputVrrHeadroomUs / 1000.0);
         label(caption, left, height - S(40), labelColor);
     }
     else label(adaptiveInput ? "Red X: frame lateness > buffer + tolerance. Gray: GPU/queue." :
           "Raw stages include queue/GPU waits. Red X: stage > buffer.", left, height - S(40), labelColor);
-    label("Frametimes: flat within 1 ms; red edges: clipped.", left, height - S(20), labelColor);
+    label("Extra = smoothing/recovery; total = buffer + extra.", left, height - S(20), labelColor);
     return surface;
 }
 
@@ -333,7 +372,7 @@ OverlayManager::OverlayManager() :
     m_Renderer(nullptr),
     m_FontData(Path::readDataFile("ModeSeven.ttf"))
 {
-    m_Overlays[OverlayType::OverlayDebug].color = {0xD0, 0xD0, 0x00, 0xFF};
+    m_Overlays[OverlayType::OverlayDebug].color = {0xD4, 0xFF, 0x00, 0xFF};
     m_Overlays[OverlayType::OverlayDebug].fontSize = 20;
 
     m_Overlays[OverlayType::OverlayStatusUpdate].color = {0xCC, 0x00, 0x00, 0xFF};
@@ -618,8 +657,11 @@ void OverlayManager::run()
             }
             const double scale = type == OverlayDebug ? fontSize / 20.0 : 1.0;
             if (drawText) {
-                if (overlay.font) surface = RenderTextOutlinedWrapped(overlay.font, text, overlay.color,
-                                                                      {0, 0, 0, 255}, int(std::lround(4 * scale)), int(std::lround(1024 * scale)));
+                if (overlay.font) {
+                    surface = type == OverlayDebug ? renderStatsText(overlay.font, text, overlay.color, scale) :
+                        RenderTextOutlinedWrapped(overlay.font, text, overlay.color,
+                            {0, 0, 0, 255}, int(std::lround(4 * scale)), int(std::lround(1024 * scale)));
+                }
                 if (!surface) continue; // Keep the last successful overlay on failure.
             }
             if (drawGraph && overlay.font) surface = composeTimingGraph(overlay.font, surface, *graph, scale);

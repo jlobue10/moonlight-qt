@@ -1801,6 +1801,18 @@ struct Metrics {
     // stock-style present-on-render emulation (decode + prepare + present).
     SenderCadenceTracker observedSenderCadence;
     SenderCadenceTracker simulatedSenderCadence;
+    // Physical display estimate: a frame shows no earlier than its submission
+    // and no sooner than one display period after its predecessor, so a
+    // policy that submits early into a flip queue gains nothing here.
+    SenderCadenceTracker simulatedDisplayCadence;
+    bool simulatedEstimatedDisplayValid = false;
+    uint64_t simulatedEstimatedDisplayUs = 0;
+    Distribution simulatedDecodeToDisplayUs;
+    // Pacer delay plus any wait between submission and the estimated display:
+    // the same quantity whether a policy holds a frame or a flip queue does.
+    Distribution simulatedQueueInclusiveDelayUs;
+    Distribution simulatedOverlayQueueInclusiveDelayUs;
+    uint64_t overlayNextQueueSampleUs = 0;
     SenderCadenceTracker stockSenderCadence;
     bool senderClockValid = false;
     uint32_t senderPriorRtpTimestamp = 0;
@@ -1811,6 +1823,20 @@ struct Metrics {
     uint64_t simulatedPriorRenderLeadUs = 0;
     Distribution simulatedPlayoutDelayUs;
     Distribution observedPlayoutDelayUs;
+    // Playout delay plus cadence retiming, display-floor pushes and the delay
+    // late-frame recovery deliberately added; readiness lateness is excluded.
+    Distribution simulatedPacerDelayUs;
+    Distribution simulatedCatchupCarryUs;
+    Distribution simulatedRetimingUs;
+    Distribution simulatedFloorPushUs;
+    Distribution simulatedPlannedExtraDelayUs;
+    Distribution simulatedPlannedTotalDelayUs;
+    // The stats overlay shows the latest value about once per second; these
+    // sample the same values at each one-second decision-time boundary.
+    uint64_t overlayNextSampleUs = 0;
+    Distribution simulatedOverlayPacerDelayUs;
+    Distribution simulatedOverlayPlayoutDelayUs;
+    Distribution simulatedOverlayExtraDelayUs;
     uint64_t arrivalSequenceGaps = 0;
     uint64_t arrivalSequenceDuplicates = 0;
     uint64_t arrivalSequenceOutOfOrderTransitions = 0;
@@ -5742,7 +5768,15 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         metrics.simulatedInputBufferSumUs / double(metrics.simulatedInputBufferRows) : 0.0;
     inputPercentile["final_buffer_us"] = double(input.currentUs);
     inputPercentile["final_target_us"] = double(input.targetUs);
-    inputPercentile["scope"] = "candidate controller input-buffer coverage over the session; misses are frames whose readiness exceeded buffer plus tolerance and recovery credit";
+    // Match the on-screen coverage window, not only cumulative session totals.
+    inputPercentile["final_window_eligible"] = double(input.recentEligible);
+    inputPercentile["final_window_missed"] = double(input.recentMissed);
+    inputPercentile["final_window_coverage_percent"] = input.recentEligible ?
+        QJsonValue(100.0 * double(input.recentEligible - std::min(input.recentEligible, input.recentMissed)) /
+                   double(input.recentEligible)) : QJsonValue(QJsonValue::Null);
+    inputPercentile["scope"] = scenario.controller.playoutInputHitchMissesOnly ?
+        "session preventable input-hitch outcomes; a miss requires input beyond buffer plus tolerance and a same-frame readiness-attributed interval stretch; inputs beyond the permitted maximum are excluded, and compressed successors are not second misses" :
+        "candidate controller input-buffer coverage over the session; misses are frames whose readiness exceeded buffer plus tolerance and recovery credit";
     simulation["input_percentile"] = inputPercentile;
     simulation["display_hz"] = simulatedDisplayHz;
     simulation["stream_fps"] = simulatedStreamFps;
@@ -6095,6 +6129,30 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
                               simulatedStreamFps : 1);
     simulation["playout_delay_us"] = distributionObject(
         metrics.simulatedPlayoutDelayUs);
+    simulation["pacer_delay_us"] = distributionObject(
+        metrics.simulatedPacerDelayUs);
+    simulation["recovery_added_us"] = distributionObject(
+        metrics.simulatedCatchupCarryUs);
+    simulation["positive_retiming_us"] = distributionObject(
+        metrics.simulatedRetimingUs);
+    simulation["display_floor_push_us"] = distributionObject(
+        metrics.simulatedFloorPushUs);
+    simulation["planned_extra_delay_us"] = distributionObject(
+        metrics.simulatedPlannedExtraDelayUs);
+    simulation["planned_total_delay_us"] = distributionObject(
+        metrics.simulatedPlannedTotalDelayUs);
+    simulation["overlay_extra_delay_us"] = distributionObject(
+        metrics.simulatedOverlayExtraDelayUs);
+    simulation["overlay_pacer_delay_us"] = distributionObject(
+        metrics.simulatedOverlayPacerDelayUs);
+    simulation["decode_to_estimated_display_us"] = distributionObject(
+        metrics.simulatedDecodeToDisplayUs);
+    simulation["queue_inclusive_delay_us"] = distributionObject(
+        metrics.simulatedQueueInclusiveDelayUs);
+    simulation["overlay_queue_inclusive_delay_us"] = distributionObject(
+        metrics.simulatedOverlayQueueInclusiveDelayUs);
+    simulation["overlay_playout_delay_us"] = distributionObject(
+        metrics.simulatedOverlayPlayoutDelayUs);
     simulation["readiness"] = readinessObject(
         metrics.simulatedReadiness,
         scenario.controller.playoutResponsiveBuffer);
@@ -7106,6 +7164,8 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         };
         addSenderScalars("replay_", metrics.simulatedSenderCadence,
                          captureDurationUs);
+        addSenderScalars("replay_display_", metrics.simulatedDisplayCadence,
+                         captureDurationUs);
         addSenderScalars("original_", metrics.observedSenderCadence,
                          captureDurationUs);
         addSenderScalars("stock_", metrics.stockSenderCadence,
@@ -7302,6 +7362,9 @@ struct TimelineDetails {
     uint64_t simulatedSourceTimeUs = 0;
     uint64_t simulatedPlayoutDelayUs = 0;
     int64_t simulatedCadenceSmoothingUs = 0;
+    uint64_t simulatedPlannedExtraDelayUs = 0;
+    uint64_t simulatedPresentationFloorPushUs = 0;
+    uint64_t simulatedRecoveryAddedUs = 0;
     bool simulatedCadenceEligible = false;
     bool simulatedSourceRateChanged = false;
     bool simulatedPhaseDiscontinuity = false;
@@ -7553,7 +7616,7 @@ bool writeTimelineHeader(QFile& file)
         "recorded_source_period_us,simulated_source_period_us,"
         "simulated_ready_offset_us,simulated_render_lead_us,"
         "simulated_readiness_budget_us,simulated_source_time_us,"
-        "simulated_playout_delay_us,simulated_cadence_smoothing_us,"
+        "simulated_playout_delay_us,simulated_cadence_smoothing_us,simulated_planned_extra_delay_us,"
         "simulated_cadence_eligible,simulated_source_rate_changed,simulated_phase_discontinuity,"
         "recorded_cadence_valid,simulated_cadence_valid,"
         "recorded_source_elapsed_us,simulated_source_elapsed_us,"
@@ -7666,7 +7729,8 @@ bool writeTimelineHeader(QFile& file)
         "recorded_free_running_scanout_position_valid,"
         "recorded_free_running_scanout_position_ppm,"
         "simulated_free_running_scanout_position_valid,"
-        "simulated_free_running_scanout_position_ppm\n";
+        "simulated_free_running_scanout_position_ppm,"
+        "simulated_presentation_floor_push_us,simulated_recovery_added_us\n";
     return file.write(header) == header.size();
 }
 
@@ -7838,6 +7902,7 @@ bool writeTimelineRow(QFile& file, uint64_t arrivalSequence, int frame,
     append(QByteArray::number(details.simulatedSourceTimeUs));
     append(QByteArray::number(details.simulatedPlayoutDelayUs));
     append(QByteArray::number(details.simulatedCadenceSmoothingUs));
+    append(QByteArray::number(details.simulatedPlannedExtraDelayUs));
     append(QByteArray::number(details.simulatedCadenceEligible ? 1 : 0));
     append(QByteArray::number(details.simulatedSourceRateChanged ? 1 : 0));
     append(QByteArray::number(details.simulatedPhaseDiscontinuity ? 1 : 0));
@@ -8067,6 +8132,8 @@ bool writeTimelineRow(QFile& file, uint64_t arrivalSequence, int frame,
         details.simulatedRaster.freeRunningScanoutPositionValid ? 1 : 0));
     append(QByteArray::number(
         details.simulatedRaster.freeRunningScanoutPositionPpm));
+    append(QByteArray::number(details.simulatedPresentationFloorPushUs));
+    append(QByteArray::number(details.simulatedRecoveryAddedUs));
     line.append('\n');
     return file.write(line) == line.size();
 }
@@ -13448,6 +13515,12 @@ int main(int argc, char* argv[])
             simulatedDecision.playoutDelayUs;
         timelineDetails.simulatedCadenceSmoothingUs =
             simulatedDecision.cadenceSmoothingUs;
+        timelineDetails.simulatedPlannedExtraDelayUs =
+            simulatedDecision.plannedExtraDelayUs();
+        timelineDetails.simulatedPresentationFloorPushUs =
+            simulatedDecision.presentationFloorPushUs;
+        timelineDetails.simulatedRecoveryAddedUs =
+            simulatedDecision.recoveryAddedUs;
         timelineDetails.simulatedCadenceEligible =
             simulatedDecision.cadenceEligible;
         timelineDetails.simulatedSourceRateChanged =
@@ -15101,6 +15174,31 @@ int main(int argc, char* argv[])
                         simulatedDecision.playoutDelayUs);
                 metrics.simulatedPlayoutDelayUs.add(
                     simulatedDecision.playoutDelayUs);
+                const int64_t pacerDelayUs =
+                    static_cast<int64_t>(simulatedDecision.playoutDelayUs) +
+                    simulatedDecision.cadenceSmoothingUs +
+                    static_cast<int64_t>(simulatedDecision.presentationFloorPushUs) +
+                    static_cast<int64_t>(simulatedDecision.recoveryAddedUs);
+                metrics.simulatedPacerDelayUs.add(
+                    static_cast<uint64_t>(std::max<int64_t>(pacerDelayUs, 0)));
+                metrics.simulatedCatchupCarryUs.add(
+                    simulatedDecision.recoveryAddedUs);
+                metrics.simulatedRetimingUs.add(static_cast<uint64_t>(
+                    std::max<int64_t>(simulatedDecision.cadenceSmoothingUs, 0)));
+                metrics.simulatedFloorPushUs.add(
+                    simulatedDecision.presentationFloorPushUs);
+                const uint64_t plannedExtraUs = simulatedDecision.plannedExtraDelayUs();
+                metrics.simulatedPlannedExtraDelayUs.add(plannedExtraUs);
+                metrics.simulatedPlannedTotalDelayUs.add(saturatingAdd(
+                    simulatedDecision.playoutDelayUs, plannedExtraUs));
+                if (simulatedDecisionUs >= metrics.overlayNextSampleUs) {
+                    metrics.simulatedOverlayPacerDelayUs.add(
+                        static_cast<uint64_t>(std::max<int64_t>(pacerDelayUs, 0)));
+                    metrics.simulatedOverlayPlayoutDelayUs.add(
+                        simulatedDecision.playoutDelayUs);
+                    metrics.simulatedOverlayExtraDelayUs.add(plannedExtraUs);
+                    metrics.overlayNextSampleUs = simulatedDecisionUs + 1000000;
+                }
                 bool recordedLateArrival = false;
                 if (columns.playoutDelayUs >= 0) {
                     const uint64_t recordedPlayoutDelayUs = unsignedField(
@@ -15120,6 +15218,31 @@ int main(int argc, char* argv[])
                     senderUs, decodeCompleteUs, simulatedSubmissionUs,
                     simulatedLateArrival, simulatedLeadJump,
                     simulatedDisplayPeriodUs);
+                const uint64_t estimatedDisplayUs = metrics.simulatedEstimatedDisplayValid ?
+                    std::max(simulatedSubmissionUs, saturatingAdd(
+                        metrics.simulatedEstimatedDisplayUs, simulatedDisplayPeriodUs)) :
+                    simulatedSubmissionUs;
+                metrics.simulatedEstimatedDisplayUs = estimatedDisplayUs;
+                metrics.simulatedEstimatedDisplayValid = true;
+                metrics.simulatedDisplayCadence.observe(
+                    senderUs, decodeCompleteUs, estimatedDisplayUs,
+                    simulatedLateArrival, simulatedLeadJump,
+                    simulatedDisplayPeriodUs);
+                if (estimatedDisplayUs >= decodeCompleteUs) {
+                    metrics.simulatedDecodeToDisplayUs.add(
+                        estimatedDisplayUs - decodeCompleteUs);
+                }
+                const int64_t queueInclusiveUs = std::max<int64_t>(0,
+                    static_cast<int64_t>(simulatedDecision.playoutDelayUs) +
+                    simulatedDecision.cadenceSmoothingUs +
+                    static_cast<int64_t>(simulatedDecision.presentationFloorPushUs) +
+                    static_cast<int64_t>(simulatedDecision.recoveryAddedUs) +
+                    static_cast<int64_t>(estimatedDisplayUs - simulatedSubmissionUs));
+                metrics.simulatedQueueInclusiveDelayUs.add(static_cast<uint64_t>(queueInclusiveUs));
+                if (simulatedDecisionUs >= metrics.overlayNextQueueSampleUs) {
+                    metrics.simulatedOverlayQueueInclusiveDelayUs.add(static_cast<uint64_t>(queueInclusiveUs));
+                    metrics.overlayNextQueueSampleUs = simulatedDecisionUs + 1000000;
+                }
                 metrics.stockSenderCadence.observe(
                     senderUs, decodeCompleteUs,
                     saturatingAdd(decodeCompleteUs,

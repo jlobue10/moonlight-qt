@@ -355,6 +355,10 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
                                  QString& error)
 {
     const auto fail = [&error](const char* text) { error = text; return false; };
+    if (value.playoutInputStableAdaptation > 1)
+        return fail("stable input adaptation must be 0 or 1");
+    if (value.playoutInputHitchMissesOnly > 10)
+        return fail("input hitch-miss policy must be between 0 and 10");
     if (value.playoutPredictionOnly > 1 || value.playoutSubmissionEstimateFallback > 1 ||
             value.playoutRequireDisplayEvents > 1 ||
             value.playoutNativeHitchAdaptation > 1 || value.playoutReadinessDrivenAdaptation > 1 ||
@@ -564,8 +568,8 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
             (value.playoutLateRecovery && value.playoutCatchupPerMille == 0)) {
         return fail("playout_late_recovery must be 0 or 1 and requires nonzero catchup");
     }
-    if (value.playoutSmoothingWindowedCadence > 5) {
-        return fail("playout_smoothing_windowed_cadence must be in 0..5");
+    if (value.playoutSmoothingWindowedCadence > 7) {
+        return fail("playout_smoothing_windowed_cadence must be in 0..7");
     }
     // Revisions before 5 ignore these, so historical snapshots may be layered
     // over current values.
@@ -574,6 +578,24 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
             value.playoutSmoothingAbsorbReservePeriodPerMille > 1000 ||
             value.playoutSmoothingMaxLagPeriodPerMille > 1000) {
         return fail("playout_smoothing recentre must be 0..1000 per mille, absorb reserve 0..20000 us, and the absorb and lag period shares 0..1000 per mille");
+    }
+    if (value.playoutInputLearningTrim > 64) {
+        return fail("playout_input_learning_trim must be in 0..64");
+    }
+    if (value.playoutInputLayerSeedRatioPerMille > 100000) {
+        return fail("playout_input_layer_seed_ratio_per_mille must be in 0..100000");
+    }
+    if (value.playoutCatchupCarryLimitUs > 100000 || value.playoutCatchupCarryLimitPeriodPerMille > 1000) {
+        return fail("playout_catchup_carry_limit_us must be 0..100000 and its period share 0..1000 per mille");
+    }
+    if (value.playoutInputRecoveryCreditRoomPerMille > 1000) {
+        return fail("playout_input_recovery_credit_room_per_mille must be in 0..1000");
+    }
+    if (value.playoutSmoothingFloorMarginUs > 20000) {
+        return fail("playout_smoothing_floor_margin_us must be in 0..20000");
+    }
+    if (value.playoutSmoothingPresentableFloor > 1) {
+        return fail("playout_smoothing_presentable_floor must be 0 or 1");
     }
     if (value.playoutSmoothingRecoveryUs > 1000000) {
         return fail("playout_smoothing_recovery_us must be in 0..1000000");

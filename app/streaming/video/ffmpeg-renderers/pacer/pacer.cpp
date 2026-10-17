@@ -333,9 +333,23 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
             // queue policy is unconditional rather than a live preference.
             context += QStringLiteral("|mean-miss-queue-v2");
             const auto recoveryPolicy = vrrTimingParametersForSession(config);
+            if (recoveryPolicy.playoutInputHitchMissesOnly)
+                context += QStringLiteral("|input-hitch-misses=%1").arg(recoveryPolicy.playoutInputHitchMissesOnly);
+            if (recoveryPolicy.playoutInputStableAdaptation)
+                context += QStringLiteral("|stable-input-adaptation=%1").arg(recoveryPolicy.playoutInputStableAdaptation);
             context += QStringLiteral("|late-recovery=%1|buffer-ratio=%2")
                 .arg(recoveryPolicy.playoutLateRecovery)
                 .arg(recoveryPolicy.playoutDelayMaximumPeriodPerMille);
+            if (recoveryPolicy.playoutInputLayerSeedRatioPerMille != 0 ||
+                    recoveryPolicy.playoutCatchupCarryLimitUs != 0) {
+                context += QStringLiteral("|input-learning=%1-%2-%3-%6|carry-limit=%4-%5")
+                    .arg(recoveryPolicy.playoutInputBoundedRecoveryCredit)
+                    .arg(recoveryPolicy.playoutInputLayerSeedRatioPerMille)
+                    .arg(recoveryPolicy.playoutInputLearningTrim)
+                    .arg(recoveryPolicy.playoutCatchupCarryLimitUs)
+                    .arg(recoveryPolicy.playoutCatchupCarryLimitPeriodPerMille)
+                    .arg(recoveryPolicy.playoutInputRecoveryCreditRoomPerMille);
+            }
             if (smoothVrrFrameTiming) {
                 // The saved flag previously selected timestamp-following
                 // playout too. Do not cross-seed its readiness calibration.

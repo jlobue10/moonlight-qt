@@ -67,10 +67,40 @@ void testConsecutiveGaps()
     }
 }
 
+// Recorded revision 5 (daily.188): source-gap phase correction with an
+// optional standing reserve, on that release's input accounting. Production
+// uses tolerance-bounded revision 4; these fixtures keep revision 5
+// explicit so its recorded behavior stays covered.
+VrrTimingParameters revision5Policy(const VrrSessionConfig& session, bool synchronized = false,
+                                    bool scheduled = false)
+{
+    auto p = vrrTimingParametersForSession(session, synchronized, scheduled);
+    p.playoutInputHitchMissesOnly = 0;
+    if (p.playoutInputPercentileEnabled) p.playoutInputBoundedRecoveryCredit = 1;
+    p.playoutInputLayerSeedRatioPerMille = p.playoutInputLearningTrim = 0;
+    p.playoutCatchupCarryLimitUs = p.playoutCatchupCarryLimitPeriodPerMille = 0;
+    if (session.smoothFrameTiming) {
+        p.playoutSmoothingWindowedCadence = 5;
+        p.playoutSmoothingMaxLagUs = std::max<uint64_t>(p.playoutIntervalToleranceUs, 2000);
+        p.playoutSmoothingMaxLagPeriodPerMille = 120;
+        p.playoutSmoothingRecenterPerMille = 1000;
+        if (session.absorbMicrostutter) {
+            p.playoutSmoothingAbsorbReserveUs = 2000;
+            p.playoutSmoothingAbsorbReservePeriodPerMille = 150;
+            p.playoutSmoothingMaxLagUs = std::max<uint64_t>(p.playoutSmoothingMaxLagUs, 8000);
+            p.playoutSmoothingMaxLagPeriodPerMille = 200;
+        }
+        p.playoutSmoothingReserveMaxUs = p.playoutSmoothingReserveToleranceUs = 0;
+        p.playoutSmoothingReservePercentilePerMille = p.playoutSmoothingReserveReleaseUsPerSecond = 0;
+        p.playoutSmoothingResetSlewUs = p.playoutSmoothingPeriodFeedbackPerMillion = 0;
+    }
+    return p;
+}
+
 // Recorded revision 4: T is both the dead zone and the shared phase limit.
 VrrTimingParameters revision4Policy(const VrrSessionConfig& session)
 {
-    auto p = vrrTimingParametersForSession(session);
+    auto p = revision5Policy(session);
     if (session.smoothFrameTiming) {
         p.playoutSmoothingWindowedCadence = 4;
         p.playoutSmoothingMaxLagUs = p.playoutIntervalToleranceUs;
@@ -82,11 +112,14 @@ VrrTimingParameters revision4Policy(const VrrSessionConfig& session)
     return p;
 }
 
-VrrTimingParameters fixedDelayPolicy(const VrrSessionConfig& session, bool revision4 = true)
+VrrTimingParameters fixedDelayPolicy(const VrrSessionConfig& session, bool production = true)
 {
-    auto p = revision4 ? revision4Policy(session) : vrrTimingParametersForSession(session);
+    auto p = production ? vrrTimingParametersForSession(session) : revision5Policy(session);
     // Isolate cadence retiming from adaptive delivery buffering and catch-up.
-    // Readiness clipping and actual schedule() still run.
+    // Readiness clipping and actual schedule() still run. These source-phase
+    // fixtures predate the policy-9 shared applied-timing slew; keep policy 8
+    // explicit here. testFixedPadAndSharedLiveSlew covers the new live policy.
+    if (production && p.playoutInputHitchMissesOnly >= 9) {p.playoutInputHitchMissesOnly=8;p.playoutInputStableAdaptation=0;}
     p.playoutDelayAdaptive = 0;
     p.sourcePlayoutDelayUs = 10000;
     p.playoutDelayMinimumUs = 10000;
@@ -256,7 +289,22 @@ void testPolicyAndInvalidTimestamps()
         session.timingOptions.toleranceUs = custom;
         const auto tolerance = session.timingOptions.resolved(mode).toleranceUs;
         for (bool native : {false, true}) {
-            const auto p = vrrTimingParametersForSession(session, native, native);
+            const auto live = vrrTimingParametersForSession(session, native, native);
+            expect(live.playoutIntervalToleranceUs == uint64_t(tolerance) &&
+                   live.playoutSmoothingWindowedCadence == 4 &&
+                   live.playoutSmoothingMaxLagUs == uint64_t(tolerance) &&
+                   live.playoutSmoothingRecenterPerMille == 0 &&
+                   live.playoutSmoothingMaxLagPeriodPerMille == 0 &&
+                   live.playoutSmoothingAbsorbReserveUs == 0 &&
+                   live.playoutSmoothingReserveMaxUs == 0 &&
+                   live.playoutSmoothingPeriodFeedbackPerMillion == 0 &&
+                   live.playoutSmoothingResetSlewUs == 0,
+                   "production Reduce judder must ignore errors within T and share one T phase budget on every presenter");
+            const auto recorded = revision4Policy(session);
+            expect(live.playoutSmoothingWindowedCadence == recorded.playoutSmoothingWindowedCadence &&
+                   live.playoutSmoothingMaxLagUs == recorded.playoutSmoothingMaxLagUs,
+                   "production must select the tested one-tolerance source-gap contract");
+            const auto p = revision5Policy(session, native, native);
             expect(p.playoutIntervalToleranceUs == uint64_t(tolerance) &&
                    p.playoutSmoothingMaxLagUs == std::max<uint64_t>(tolerance, 2000) &&
                    p.playoutSmoothingWindowedCadence == 5 &&
@@ -332,6 +380,32 @@ void testRevision5Recentering()
            "recentring must not use tolerance the interval has already spent");
 }
 
+void testRevision5PresentableFloor()
+{
+    using Vrr13::sourceGapPhaseUs;
+    // 115 FPS on a 120 Hz panel: reference - T = 8.18 ms is below 8.333 ms.
+    const uint64_t reference = 8680, t = 500, floor = 8333;
+    expect(7140 + sourceGapPhaseUs(7140, reference, t, 4000, 1000, 0) == 8180,
+           "without a floor a short gap lands on reference - T");
+    expect(7140 + sourceGapPhaseUs(7140, reference, t, 4000, 1000, 0, floor) == int64_t(floor),
+           "a short gap must land on the display period, not below it");
+    expect(9680 + sourceGapPhaseUs(9680, reference, t, 4000, 1000, 0, floor) == 9180,
+           "the floor must not change the upper edge");
+    expect(sourceGapPhaseUs(8400, reference, t, 4000, 0, 0, floor) == 0,
+           "a gap already between the floor and the reference stays untouched");
+    expect(7000 + sourceGapPhaseUs(7000, 8000, t, 4000, 0, 0, floor) == 8000,
+           "a floor above the reference is capped at the reference");
+    int64_t phase = 2000;
+    for (int i = 0; i < 64; ++i) {
+        const int64_t next = sourceGapPhaseUs(reference, reference, t, 4000, 1000, phase, floor);
+        expect(int64_t(reference) + next - phase >= int64_t(floor),
+               "recentring must not shorten an interval below the floor");
+        expect(next >= 0 && next <= phase, "recentring must move the phase toward zero");
+        phase = next;
+    }
+    expect(phase == 0, "clean gaps must still return the phase to zero above the floor");
+}
+
 VrrSessionConfig absorbSession(bool smoothing, bool absorb)
 {
     VrrSessionConfig session;
@@ -347,8 +421,19 @@ VrrSessionConfig absorbSession(bool smoothing, bool absorb)
 void testAbsorbPolicySelection()
 {
     for (bool native : {false, true}) {
-        const auto rj = vrrTimingParametersForSession(absorbSession(true, false), native, native);
-        const auto absorb = vrrTimingParametersForSession(absorbSession(true, true), native, native);
+        const auto liveRj = vrrTimingParametersForSession(absorbSession(true, false), native, native);
+        const auto liveAbsorb = vrrTimingParametersForSession(absorbSession(true, true), native, native);
+        expect(liveAbsorb.playoutSmoothingWindowedCadence == 7 &&
+                   liveAbsorb.playoutSmoothingGainPerMille == liveRj.playoutSmoothingGainPerMille &&
+                   liveAbsorb.playoutSmoothingMaxLagUs == 2 * liveAbsorb.playoutIntervalToleranceUs &&
+                   liveAbsorb.playoutSmoothingReserveMaxUs == 0 &&
+                   liveAbsorb.playoutSmoothingReservePercentilePerMille == 0 &&
+                   liveAbsorb.playoutSmoothingAbsorbReserveUs == 2 * liveAbsorb.playoutIntervalToleranceUs &&
+                   liveRj.playoutSmoothingReserveMaxUs == liveAbsorb.playoutSmoothingReserveMaxUs &&
+                   liveRj.playoutSmoothingMaxLagUs < liveAbsorb.playoutSmoothingMaxLagUs,
+               "production Absorb uses local cadence and a fixed 2T pad without a learned reserve");
+        const auto rj = revision5Policy(absorbSession(true, false), native, native);
+        const auto absorb = revision5Policy(absorbSession(true, true), native, native);
         const auto off = vrrTimingParametersForSession(absorbSession(false, true), native, native);
         expect(rj.playoutSmoothingAbsorbReserveUs == 0 && rj.playoutSmoothingAbsorbReservePeriodPerMille == 0,
                "Reduce judder alone must not hold a standing reserve");
@@ -365,13 +450,59 @@ void testAbsorbPolicySelection()
                "Absorb microstutter must have no effect without Reduce judder");
     }
 }
+void testFixedPadAndSharedLiveSlew()
+{
+    for(const uint64_t version : {9,10}) for(const int tolerance : {250,500,1000}) {
+        auto session=absorbSession(true,true);
+        session.streamRateHz=120;session.displayRefreshHz=240;
+        session.experimentalInputPercentilePpm=1;
+        session.experimentalBoundedCatchup=true;
+        session.timingOptions={4000,9950,120,tolerance};
+        auto p=vrrTimingParametersForSession(session);
+        p.playoutInputHitchMissesOnly=version;p.playoutInputStableAdaptation=0;
+        p.playoutDelayStartSeedUs=4000;
+        VrrTimingController c(session,true,p);
+        uint32_t pts=0;uint64_t previousTotal=0,previousExtra=0,previousInput=0,previousAt=0,submitted=0;
+        for(int f=0;f<700;++f) {
+            pts+=f>=150 && f<400?(f%2?990:810):900;
+            const uint64_t at=1000000+uint64_t(pts)*100/9;
+            PacedFrame frame(nullptr,f,pts,true,at+1000);
+            frame.setDeliveryTimeline(at+200,at+400,at+500);
+            const uint64_t now=std::max(at+1000,submitted);
+            const auto d=c.schedule(frame,now);
+            expect(c.smoothingReserveUs()==uint64_t(tolerance*2),
+                   "Absorb retains exactly its fixed 2T reserve throughout source jitter");
+            expect(d.cadenceSmoothingUs>=0 && d.cadenceSmoothingUs<=int64_t(tolerance*2),
+                   "Absorb timing spends only its fixed pad and cannot add another reserve");
+            const uint64_t total=d.playoutDelayUs+d.plannedExtraDelayUs();
+            if(previousAt) {
+                const uint64_t extra=d.plannedExtraDelayUs();
+                const uint64_t change=version==9 ? std::max(total,previousTotal)-std::min(total,previousTotal) :
+                    std::max(extra,previousExtra)-std::min(extra,previousExtra);
+                expect(change<=uint64_t(tolerance)*(now-previousAt)/1000000+2,
+                       "extra-delay movement stays bounded; recorded policy 9 also charges input movement");
+                if (version==10) {
+                    const uint64_t inputChange=std::max(d.playoutDelayUs,previousInput)-std::min(d.playoutDelayUs,previousInput);
+                    const uint64_t rate=d.playoutDelayUs>previousInput ? 1000 : 5000;
+                    expect(inputChange<=rate*(now-previousAt)/1000000+2,
+                           "live input uses its normal rise/release bound independently of extra delay");
+                }
+            }
+            previousAt=now;previousTotal=total;previousExtra=d.plannedExtraDelayUs();previousInput=d.playoutDelayUs;
+            submitted=std::max(d.targetUs,now+500);
+            c.notePreparationDuration(500,0,now+500);
+            c.noteSchedulerDelays(0,0,true);
+            c.noteSubmission(true,false,submitted,submitted);
+        }
+    }
+}
 
 void testAbsorbReserveIsStandingLatency()
 {
     const auto plainSession = absorbSession(false, false);
     const auto absorbingSession = absorbSession(true, true);
-    VrrTimingController plain(plainSession, true, vrrTimingParametersForSession(plainSession));
-    VrrTimingController absorbing(absorbingSession, true, vrrTimingParametersForSession(absorbingSession));
+    VrrTimingController plain(plainSession, true, revision5Policy(plainSession));
+    VrrTimingController absorbing(absorbingSession, true, revision5Policy(absorbingSession));
     uint32_t stamp = 0;
     for (int i = 0; i < 600; ++i) {
         stamp += 750;
@@ -442,8 +573,8 @@ void testDisplacedFramesAreAbsorbed()
 {
     const auto session = absorbSession(true, false);
     const auto absorbing = absorbSession(true, true);
-    const auto fixedPolicy = vrrTimingParametersForSession(session);
-    const auto absorbPolicy = vrrTimingParametersForSession(absorbing);
+    const auto fixedPolicy = revision5Policy(session);
+    const auto absorbPolicy = revision5Policy(absorbing);
     const auto recorded = runDisplacedFrames(session, revision4Policy(session), 0);
     const auto fixed = runDisplacedFrames(session, fixedPolicy, 0);
     const auto absorbed = runDisplacedFrames(absorbing, absorbPolicy, 0);
@@ -543,7 +674,7 @@ void testAbsorbDoesNotClipShortDisplacements()
     session.streamRateHz = 60;
     session.displayRefreshHz = 120;
     for (bool native : {false, true}) {
-        auto current = vrrTimingParametersForSession(session, true, native);
+        auto current = revision5Policy(session, true, native);
         current.playoutDelayAdaptive = 0;
         current.sourcePlayoutDelayUs = 10000;
         current.playoutDelayMinimumUs = current.playoutDelayMaximumUs = 10000;
@@ -595,7 +726,9 @@ int main()
     testLowRatePhaseLimit();
     testRevision5Boundaries();
     testRevision5Recentering();
+    testRevision5PresentableFloor();
     testAbsorbPolicySelection();
+    testFixedPadAndSharedLiveSlew();
     testAbsorbReserveIsStandingLatency();
     testDisplacedFramesAreAbsorbed();
     testBoundaries();

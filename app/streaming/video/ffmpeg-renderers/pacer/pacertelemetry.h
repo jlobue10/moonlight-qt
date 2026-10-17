@@ -68,6 +68,10 @@ struct PacerTelemetrySnapshot {
     uint64_t vrrGuardUs = 0;
     uint64_t vrrSourcePeriodUs = 0;
     uint64_t vrrAppliedBufferUs = 0, vrrBufferCapUs = 0, vrrGpuReadinessLeadUs = 0;
+    // Requested positive phase beyond the input buffer: cadence retiming,
+    // display floor and retained recovery. Independent of how much of this
+    // frame's readiness wait has already elapsed; excludes a new input miss.
+    uint64_t vrrAppliedSmoothingUs = 0;
 };
 
 struct VrrTelemetrySample {
@@ -75,6 +79,7 @@ struct VrrTelemetrySample {
     uint64_t queueResidenceUs = 0;
     uint64_t decodeWaitUs = 0;
     uint64_t bufferUs = 0;
+    uint64_t smoothingUs = 0;
     uint64_t submissionUs = 0;
     // Reset only at a real presentation epoch boundary. Local drops and host
     // stalls affect motion and must not erase the following interval.
@@ -258,6 +263,7 @@ public:
         m_Snapshot.vrrGuardUs = sample.guardUs;
         m_Snapshot.vrrSourcePeriodUs = sample.sourcePeriodUs;
         m_Snapshot.vrrAppliedBufferUs = sample.bufferUs;
+        m_Snapshot.vrrAppliedSmoothingUs = sample.smoothingUs;
         m_Snapshot.vrrBufferCapUs = sample.bufferCapUs;
         m_Snapshot.vrrGpuReadinessLeadUs = sample.gpuReadinessLeadUs;
     }

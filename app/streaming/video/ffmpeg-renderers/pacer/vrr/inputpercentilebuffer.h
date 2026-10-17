@@ -6,17 +6,19 @@
 #include <vector>
 
 namespace Vrr13 {
-// Experimental input-deadline coverage controller. probabilityPpm is a frame
+// Input coverage controller. The hitch-only policy scores actual preventable
+// input-caused hitches; historical policy scores raw overruns. probabilityPpm is a frame
 // probability; it must never be substituted for interval severity quality.
 // requiredUs is a causal input offset from the budget-adjusted input slot,
 // while slotUs is the unbuffered source slot used only for continuity.
 // Intentional decoder
-// backlog and policy holds removed by the caller. Capacity/packet-loss/basis
-// eligibility is also owned by the caller, not inferred from input lateness.
+// backlog and policy holds removed by the caller. The caller owns capacity,
+// packet-loss and basis eligibility. Hitch-only scoring additionally excludes
+// input beyond the selected maximum as unpreventable within this policy.
 //
-// vrrHeadroomUs is usable recovery credit supplied by the caller. Current
-// bounded catch-up limits it by both physical VRR room and the interval
-// allowance. Historical callers retain their recorded credit. Requirements
+// vrrHeadroomUs is recovery credit supplied by the caller. Hitch-only scoring
+// never uses it to erase an actual miss; demand may use it while the goal is
+// met. Historical callers retain their recorded credit rules. Requirements
 // may also carry a clockOffsetUs so retained measurements share an immutable
 // source coordinate; historical coverage outcomes keep their observed budget.
 class InputPercentileBuffer {
@@ -41,7 +43,12 @@ public:
         // Outcomes observed with each frame's actual buffer/tolerance inside
         // the effective trailing profile window. They are historical outcomes,
         // not counterfactual coverage under a newly selected tolerance.
+        // The controller's policy-8 telemetry substitutes its session-wide
+        // trailing outcomes here; this buffer's internal counters stay local.
         uint64_t recentEligible = 0, recentAbsorbed = 0, recentMissed = 0;
+        // Reporting only: recent responsiveness alongside the full learning history.
+        uint64_t reportingWindowUs = 0, reportingEligible = 0;
+        uint64_t reportingAbsorbed = 0, reportingMissed = 0;
         uint64_t raises = 0, lowers = 0, unknownRelease = 0, epochResets = 0;
         uint64_t observationSpanUs = 0, validPairCoverageUs = 0;
         uint64_t probabilityPpm = 0, windowUs = 0, toleranceUs = 0, vrrHeadroomUs = 0;
@@ -66,7 +73,20 @@ public:
     // 22:48/22:55 sessions; tracking the maximum missed 8 and 16.
     // A buffer resumed from evidence it already trusts skips learning.
     void endLearning() { m_Learning = false; }
+    // Keep the learned percentile and configured fall rate in charge. Miss
+    // eligibility and the evidence required for growth remain independent.
+    void setStableAdaptation(bool stable) { m_StableAdaptation = stable; }
+    // While learning, ignore the largest `trim` requirements so one startup
+    // or scene-load outlier cannot set protection.
+    void setLearningTrim(size_t trim) { m_LearningTrim = trim; }
     bool learning() const { return m_Learning; }
+    bool layerTransitionActive() const { return m_LayerTransitionActive; }
+    bool fastLayerDrain() const { return (m_LayerTransitionActive && m_LayerFastDrain) ||
+        (m_RateDropDrain && m_RateDropFastDrain); }
+    void setRateDropDrain(bool active) {
+        m_RateDropDrain = active;
+        if (!active) m_RateDropFastDrain = false;
+    }
     // A changed source phase, cadence, or normalized-input basis invalidates
     // prior requirements. Retain current protection while relearning its size.
     void breakSequence() {
@@ -75,6 +95,7 @@ public:
         m_Stats.samples = m_Stats.observationSpanUs = m_Stats.validPairCoverageUs = 0;
         m_Stats.recentEligible = m_Stats.recentAbsorbed = m_Stats.recentMissed = 0;
         updateReleaseFeedback(m_LastClockUs);
+        m_SourceRelativeMissQuantileUs = 0;
         m_SourceRelativeQuantileUs = m_Stats.rawRequiredQuantileUs = 0;
         m_Stats.headroomTargetUnclippedUs = m_Stats.currentUs;
         m_Stats.tailUncertain = true;
@@ -84,6 +105,10 @@ public:
         m_LastEvaluationUs = m_LastTruncatedUs = m_ReleaseFraction = 0;
         m_PreviousValid = false;
         m_Direction = 0;
+        m_ReleaseIntervalUs = 0;
+        m_ReleaseStepRemainingUs = 0;
+        m_LayerTransitionActive = false;
+        restartReleaseFeedback();
         ++m_Epoch;
         // Keep elapsed/last-eligible clocks and diagnostics: recurring phase
         // breaks must not rearm the unknown-evidence retention window forever.
@@ -93,6 +118,9 @@ public:
     // Only frame adjacency breaks; evidence and coverage outcomes are kept.
     void breakAdjacency() {
         m_PreviousValid = false;
+        m_ReleaseIntervalUs = 0;
+        m_ReleaseStepRemainingUs = 0;
+        restartReleaseFeedback();
         ++m_Epoch;
     }
     // A new rate layer starts from a copy of its neighbour's evidence. The
@@ -107,6 +135,7 @@ public:
             sample.seed = true;
             sample.absorbed = sample.missed = false;
         }
+        restartReleaseFeedback();
     }
     // Session totals and stage diagnostics continue across rate-band layers;
     // evidence, protection and coverage outcomes stay with each band.
@@ -132,6 +161,7 @@ public:
         m_Stats.currentUs = reduce(m_Stats.currentUs);
         m_Stats.targetUs = reduce(m_Stats.targetUs);
         m_ReleaseFraction = 0;
+        restartReleaseFeedback();
     }
     // Source-rate change that lost VRR headroom: the retained evidence already
     // sets the target at the new rate (call after advance()), so step to it at
@@ -156,6 +186,51 @@ public:
         m_Stats.currentUs = m_Stats.targetUs;
         m_ReleaseFraction = 0;
     }
+    // Applied protection is a local duration. Only movement of the actual
+    // producer mapping changes that duration; drift normalization of retained
+    // evidence is not another movement of the playback deadline.
+    void remapProtection(int64_t previousMappingUs, int64_t mappingUs) {
+        const auto project = [&](uint64_t value) {
+            if (mappingUs >= previousMappingUs) {
+                const uint64_t delta = uint64_t(mappingUs) - uint64_t(previousMappingUs);
+                return value - std::min(value, delta);
+            }
+            const uint64_t delta = uint64_t(previousMappingUs) - uint64_t(mappingUs);
+            return value + std::min(std::numeric_limits<uint64_t>::max() - value, delta);
+        };
+        m_Stats.currentUs = std::clamp(project(m_Stats.currentUs), m_Stats.minimumUs, m_Stats.maximumUs);
+        m_Stats.targetUs = std::clamp(project(m_Stats.targetUs), m_Stats.minimumUs, m_Stats.maximumUs);
+        if (previousMappingUs != mappingUs) restartReleaseFeedback();
+    }
+    // Selecting a layer restores its learned buffer, but only a substantial
+    // increase may jump. A decrease keeps the applied buffer and its learned
+    // destination while normal release drains it. Recorded policy 9 instead
+    // spends at most T per fresh source frame.
+    void transitionFrom(uint64_t previousUs) {
+        if (m_HitchMissesOnly < 9) return;
+        const uint64_t learnedUs = m_Stats.currentUs;
+        previousUs = std::max(previousUs, m_Stats.minimumUs);
+        m_LayerTransitionActive = false;
+        m_LayerDrainStepRemainingUs = 0;
+        if (learnedUs == previousUs ||
+            (learnedUs > previousUs && learnedUs - previousUs > m_Stats.toleranceUs)) return;
+        m_LayerTransitionTargetUs = learnedUs;
+        m_LayerTransitionActive = true;
+        m_LayerFastDrain = previousUs > learnedUs && previousUs - learnedUs > m_Stats.toleranceUs;
+        m_Stats.currentUs = previousUs;
+        m_Stats.targetUs = learnedUs;
+        m_ReleaseFraction = 0;
+        restartReleaseFeedback();
+    }
+    void prepareForLayerStorage() {
+        setRateDropDrain(false);
+        if (m_HitchMissesOnly >= 9 && m_LayerTransitionActive) {
+            // A draining transition is still carrying the previous layer's
+            // excess; do not save that excess as this layer's learned queue.
+            m_Stats.currentUs = m_Stats.targetUs = m_LayerTransitionTargetUs;
+            m_LayerTransitionActive = false;
+        }
+    }
     uint64_t demand(uint64_t applied) const {
         return m_Stats.initialized ? m_Stats.currentUs : applied;
     }
@@ -166,7 +241,7 @@ public:
         return result;
     }
     // Raw graph-stage misses remain cumulative diagnostics. Recent miss counts
-    // use eligible causal requirements; only the long quantile actuates demand.
+    // use eligible causal outcomes; goal pressure also gates quantile-driven growth.
     void noteBufferMiss(uint64_t atUs, bool networkMiss, bool decoderMiss) {
         if (!atUs || (!networkMiss && !decoderMiss)) return;
         if (networkMiss) {
@@ -186,8 +261,9 @@ public:
     void advance(uint64_t atUs, uint64_t minimum, uint64_t maximum,
                  uint64_t probabilityPpm, uint64_t windowUs,
                  uint64_t riseRate, uint64_t fallRate, int64_t readinessBudgetUs = 0, uint64_t toleranceUs = 0,
-                 uint64_t vrrHeadroomUs = 0, int64_t clockOffsetUs = 0) {
+                 uint64_t vrrHeadroomUs = 0, int64_t clockOffsetUs = 0, uint64_t hitchMissesOnly = 0) {
         if (!atUs || (m_LastClockUs && atUs < m_LastClockUs)) return;
+        m_HitchMissesOnly = hitchMissesOnly;
         configure(minimum, maximum, probabilityPpm, windowUs, riseRate, fallRate, readinessBudgetUs, toleranceUs, vrrHeadroomUs, clockOffsetUs);
         const uint64_t elapsed = advanceClock(atUs);
         evaluate(atUs, expire(atUs));
@@ -197,14 +273,16 @@ public:
         if (!m_Stats.initialized || !m_Stats.windowUs) return;
         advance(atUs, m_Stats.minimumUs, m_Stats.maximumUs, m_Stats.probabilityPpm,
             m_Stats.windowUs, m_RiseRate, m_FallRate, m_Stats.readinessBudgetUs, m_Stats.toleranceUs,
-            m_Stats.vrrHeadroomUs, m_Stats.clockOffsetUs);
+            m_Stats.vrrHeadroomUs, m_Stats.clockOffsetUs, m_HitchMissesOnly);
     }
     void observe(uint64_t frame, uint64_t observationUs, uint64_t slotUs,
                  int64_t requiredUs, bool valid, uint64_t minimum,
                  uint64_t maximum, uint64_t probabilityPpm,
                  uint64_t windowUs, uint64_t riseRate, uint64_t fallRate,
                  int64_t readinessBudgetUs = 0, uint64_t toleranceUs = 0,
-                 uint64_t vrrHeadroomUs = 0, int64_t clockOffsetUs = 0) {
+                 uint64_t vrrHeadroomUs = 0, int64_t clockOffsetUs = 0,
+                 bool qualifyingHitch = true, uint64_t hitchMissesOnly = 0) {
+        m_HitchMissesOnly = hitchMissesOnly;
         configure(minimum, maximum, probabilityPpm, windowUs, riseRate, fallRate, readinessBudgetUs, toleranceUs, vrrHeadroomUs, clockOffsetUs);
         // An observation can follow advance() at the same timestamp. Actual
         // duplicate/nonmonotonic observations still invalidate their history.
@@ -218,8 +296,6 @@ public:
         m_LastObservationUs = observationUs;
         const uint64_t elapsed = advanceClock(observationUs);
         bool changed = expire(observationUs);
-        const bool eligible = valid && slotUs;
-        m_Stats.lastInputEligible = eligible;
         m_Stats.lastInputRequiredUs = requiredUs;
         m_Stats.lastInputObservationUs = observationUs;
         ++m_Stats.observed;
@@ -228,17 +304,39 @@ public:
         // VRR headroom is subtracted the same way: it absorbs lateness for free.
         const uint64_t excess = requiredUs > 0 ?
             uint64_t(requiredUs) - std::min(uint64_t(requiredUs), toleranceUs) : 0;
-        const uint64_t headroom = excess - std::min(excess, m_Stats.vrrHeadroomUs);
+        // Physical VRR room may make a late input harmless, but cannot erase
+        // a hitch that actually happened. New scoring uses B+T; the caller
+        // separately proves whether the input overrun caused a hitch.
+        const uint64_t headroom = m_HitchMissesOnly ? excess :
+            excess - std::min(excess, m_Stats.vrrHeadroomUs);
+        // Inputs beyond the selected maximum cannot be protected within this
+        // policy. They remain raw diagnostics, not failures or invented clean
+        // samples in the preventable-miss goal.
+        const bool eligible = valid && slotUs &&
+            (!m_HitchMissesOnly || headroom <= m_Stats.maximumUs);
+        m_Stats.lastInputEligible = eligible;
         const bool absorbed = eligible && headroom > 0 && headroom <= m_Stats.currentUs;
-        const bool missed = eligible && headroom > m_Stats.currentUs;
+        const bool missed = eligible && headroom > m_Stats.currentUs &&
+            (!m_HitchMissesOnly || qualifyingHitch);
         if (eligible) {
             ++m_Stats.eligible;
             m_Stats.absorbed += absorbed;
             m_Stats.missed += missed;
         } else ++m_Stats.ineligible;
+        if (m_HitchMissesOnly >= 9 && missed) {
+            restartReleaseFeedback();
+            m_LayerTransitionActive = false;
+        }
         const bool adjacent = eligible && m_PreviousValid && frame == m_PreviousFrame + 1 &&
             slotUs > m_PreviousSlotUs && slotUs - m_PreviousSlotUs < 1000000;
+        if (m_HitchMissesOnly >= 7) {
+            m_ReleaseIntervalUs = adjacent ? slotUs - m_PreviousSlotUs : 0;
+            m_ReleaseStepRemainingUs = std::min({m_ReleaseIntervalUs / 200,
+                m_Stats.toleranceUs / 2, m_Stats.vrrHeadroomUs});
+        }
         if (!adjacent) ++m_Epoch;
+        if (m_HitchMissesOnly >= 9)
+            m_LayerDrainStepRemainingUs = adjacent ? m_Stats.toleranceUs : 0;
         if (eligible) {
             m_LastEligibleUs = observationUs;
             const int64_t rawRequired = readinessBudgetUs > 0 &&
@@ -259,9 +357,16 @@ public:
             m_LastTruncatedUs = observationUs;
             changed = true;
         }
-        evaluate(observationUs, changed);
-        if (m_Learning && eligible && m_Stats.targetUs > m_Stats.currentUs) {
-            m_Stats.currentUs = m_Stats.targetUs;
+        evaluate(observationUs, changed, missed ? headroom : 0);
+        // A proven hitch already spent this input delay. Retain that phase
+        // for subsequent frames instead of spending seconds below the known
+        // requirement. Never step past this frame's measured demand: an older
+        // larger target or harmless late input cannot authorize the jump.
+        const uint64_t attackTarget = m_HitchMissesOnly >= 2 ?
+            (missed ? std::min(m_Stats.targetUs, headroom) : m_Stats.currentUs) : m_Stats.targetUs;
+        if (m_HitchMissesOnly < 7 && (m_Learning || m_HitchMissesOnly >= 2) &&
+                eligible && attackTarget > m_Stats.currentUs) {
+            m_Stats.currentUs = attackTarget;
             ++m_Stats.raises;
             m_ReleaseFraction = 0;
         }
@@ -294,9 +399,38 @@ private:
             m_Stats.initialized = true;
             m_Stats.currentUs = m_Stats.targetUs = minimum;
         }
+        if ((m_HitchMissesOnly == 3 || m_HitchMissesOnly == 4) &&
+                m_Stats.windowUs && clockOffset != m_Stats.clockOffsetUs) {
+            // Evidence already lives in the immutable source coordinate.
+            // Retained protection must live there too: moving the mapping
+            // forward must remove the same amount from B, rather than adding
+            // that delay again while B drains at the ordinary release rate.
+            // The reverse transform retains the same source deadline; it is
+            // not fresh protection or a new miss. Bounds still apply below.
+            const auto project = [&](uint64_t value) {
+                if (clockOffset > m_Stats.clockOffsetUs) {
+                    const uint64_t delta = uint64_t(clockOffset) - uint64_t(m_Stats.clockOffsetUs);
+                    return value - std::min(value, delta);
+                }
+                const uint64_t delta = uint64_t(m_Stats.clockOffsetUs) - uint64_t(clockOffset);
+                return value + std::min(std::numeric_limits<uint64_t>::max() - value, delta);
+            };
+            const uint64_t tail = 1000000 - std::clamp<uint64_t>(probabilityPpm, 1, 999999);
+            const bool goalMet = m_Stats.recentEligible &&
+                m_Stats.recentMissed * 1000000 <= m_Stats.recentEligible * tail;
+            // A rate correction must not spend protection while proven
+            // misses already exceed the selected allowance. Resume giving
+            // back surplus mapping delay only after coverage has recovered.
+            if (m_HitchMissesOnly < 4 || clockOffset < m_Stats.clockOffsetUs || goalMet)
+                m_Stats.currentUs = project(m_Stats.currentUs);
+            m_Stats.targetUs = project(m_Stats.targetUs);
+        }
         m_Stats.minimumUs = minimum;
         m_Stats.maximumUs = maximum;
-        m_Stats.currentUs = std::clamp(m_Stats.currentUs, minimum, maximum);
+        // A shrinking source-rate cap changes demand, not the applied queue
+        // in one step. Policy 9 slews existing excess down to the new cap.
+        m_Stats.currentUs = m_HitchMissesOnly >= 9 ? std::max(m_Stats.currentUs, minimum) :
+            std::clamp(m_Stats.currentUs, minimum, maximum);
         m_Stats.targetUs = std::clamp(m_Stats.targetUs, minimum, maximum);
         m_Stats.probabilityPpm = std::clamp<uint64_t>(probabilityPpm, 1, 999999);
         m_Stats.windowUs = std::clamp(windowUs, MinimumWindowUs, MaximumWindowUs);
@@ -306,6 +440,12 @@ private:
         m_Stats.clockOffsetUs = clockOffset;
         m_RiseRate = std::min<uint64_t>(riseRate, 1000000);
         m_FallRate = std::min<uint64_t>(fallRate, 1000000);
+        // Policy 9 accidentally changed ordinary adaptation as well as layers.
+        // Policy 10 restores the pre-existing rise and healthy release law.
+        if (m_HitchMissesOnly == 9) {
+            m_RiseRate = std::min(m_RiseRate, tolerance);
+            m_FallRate = std::min(m_FallRate, tolerance);
+        }
     }
     uint64_t advanceClock(uint64_t atUs) {
         const uint64_t elapsed = m_LastClockUs ? std::min<uint64_t>(atUs - m_LastClockUs, 100000) : 0;
@@ -334,6 +474,10 @@ private:
         uint64_t misses = 0;
         for (auto it = m_Samples.rbegin(); it != m_Samples.rend(); ++it) {
             if (atUs - it->at >= ReleaseFeedbackWindowUs) break;
+            if (m_HitchMissesOnly) {
+                misses += it->missed;
+                continue;
+            }
             const int64_t relativeRequired = offsetDifference(it->required, m_Stats.clockOffsetUs);
             const uint64_t required = relativeRequired > m_Stats.readinessBudgetUs ?
                 uint64_t(relativeRequired) - uint64_t(m_Stats.readinessBudgetUs) : 0;
@@ -347,6 +491,7 @@ private:
         m_Stats.recentReleaseSamples = 0;
         for (auto it = m_Samples.rbegin(); it != m_Samples.rend(); ++it) {
             if (atUs - it->at >= ReleaseFeedbackWindowUs) break;
+            if (m_HitchMissesOnly >= 7 && it->seed) continue;
             ++m_Stats.recentReleaseSamples;
         }
         m_Stats.recentReleaseMisses = recentMissesAt(atUs, m_Stats.currentUs);
@@ -360,8 +505,78 @@ private:
         m_Stats.releaseFactorPpm = 1000000;
         m_Stats.effectiveFallRateUsPerSecond = m_FallRate;
         m_Stats.effectiveFallRateMilliUsPerSecond = m_FallRate * 1000;
+        if (canProbeRelease() && (m_HitchMissesOnly != 9 || m_EvidenceBackedRelease)) {
+            // Release at no more than 0.5% of source cadence, half the selected
+            // tolerance, and the available VRR credit per interval. Presentation
+            // recovery still enforces the shared physical/cadence floor.
+            const uint64_t step = std::min({m_ReleaseIntervalUs / 200,
+                m_Stats.toleranceUs / 2, m_Stats.vrrHeadroomUs});
+            uint64_t rate = step * 1000000 / m_ReleaseIntervalUs;
+            // Measured surplus may drain faster than a speculative trial, but
+            // never faster than the selected growth rate in the current layer.
+            if (m_HitchMissesOnly == 9) rate = std::min(rate, m_RiseRate);
+            m_Stats.effectiveFallRateUsPerSecond = std::max(m_FallRate, rate);
+            m_Stats.effectiveFallRateMilliUsPerSecond = m_Stats.effectiveFallRateUsPerSecond * 1000;
+        }
     }
-    void evaluate(uint64_t atUs, bool removedSamples) {
+    bool canProbeRelease() const {
+        const uint64_t tail = 1000000 - m_Stats.probabilityPpm;
+        return !m_StableAdaptation && m_HitchMissesOnly >= 7 && m_ReleaseIntervalUs && m_Stats.vrrHeadroomUs &&
+            m_Stats.toleranceUs &&
+            m_Stats.recentEligible && m_Stats.recentReleaseSamples >= 8 &&
+            (m_HitchMissesOnly >= 9 ||
+             m_Stats.recentMissed * 1000000 <= m_Stats.recentEligible * tail) &&
+            m_Stats.recentReleaseMisses == 0 && m_LastEligibleUs &&
+            m_LastClockUs >= m_LastEligibleUs && m_LastClockUs - m_LastEligibleUs < 100000 &&
+            m_Stats.validPairCoverageUs >= 500000 && !m_Stats.historyTruncated;
+    }
+    void restartReleaseFeedback() {
+        m_ReleaseTrialActive = false;
+        m_ReleaseTrialWaiting = true;
+        m_ReleaseTrialAtUs = m_LastClockUs;
+        m_ReleaseTrialEligible = m_Stats.eligible;
+        m_EvidenceBackedRelease = false;
+    }
+    void applyFeedbackBoundedRelease(uint64_t atUs, uint64_t measuredTargetUs) {
+        // The ordinary target covers the measured input quantile without
+        // assuming that unused VRR room would have prevented a proven hitch.
+        // Only that evidence permits continuous accelerated release.
+        // The previous target may itself be an unfinished trial. Its lower
+        // value is not new evidence authorizing continuous release.
+        if (m_Stats.targetUs < m_Stats.currentUs && measuredTargetUs >= m_Stats.currentUs)
+            m_Stats.targetUs = m_Stats.currentUs;
+        m_EvidenceBackedRelease = m_Stats.targetUs < m_Stats.currentUs;
+        if (m_Stats.targetUs != m_Stats.currentUs) {
+            restartReleaseFeedback();
+            m_EvidenceBackedRelease = m_Stats.targetUs < m_Stats.currentUs;
+            return;
+        }
+        if (!canProbeRelease()) return;
+        const uint64_t tail = 1000000 - m_Stats.probabilityPpm;
+        const uint64_t needed = (1000000 + tail - 1) / tail;
+        if (m_ReleaseTrialActive && m_Stats.currentUs <= m_ReleaseTrialFloorUs) {
+            // Feedback starts after the reduction has finished. Outcomes at
+            // the larger buffer do not validate the smaller one.
+            m_ReleaseTrialActive = false;
+            m_ReleaseTrialWaiting = true;
+            m_ReleaseTrialAtUs = atUs;
+            m_ReleaseTrialEligible = m_Stats.eligible;
+        }
+        if (m_ReleaseTrialWaiting) {
+            if (atUs - m_ReleaseTrialAtUs < ReleaseFeedbackWindowUs ||
+                m_Stats.eligible - m_ReleaseTrialEligible < needed) return;
+            m_ReleaseTrialWaiting = false;
+        }
+        if (!m_ReleaseTrialActive) {
+            const uint64_t probe = std::min<uint64_t>(100, m_Stats.toleranceUs / 4);
+            m_ReleaseTrialFloorUs = m_Stats.currentUs -
+                std::min(probe, m_Stats.currentUs - m_Stats.minimumUs);
+            m_ReleaseTrialActive = true;
+        }
+        m_Stats.targetUs = std::min(m_Stats.targetUs, m_ReleaseTrialFloorUs);
+    }
+    void evaluate(uint64_t atUs, bool removedSamples, uint64_t missDemandUs = 0) {
+        const uint64_t previousTargetUs = m_Stats.targetUs;
         updateReleaseFeedback(atUs);
         const uint64_t windowUs = m_Stats.windowUs;
         const uint64_t probabilityPpm = m_Stats.probabilityPpm;
@@ -374,6 +589,7 @@ private:
         m_Stats.expiredUnknown = m_Samples.empty() && atUs -
             (m_LastEligibleUs ? m_LastEligibleUs : m_FirstObservationUs) >= windowUs;
         if (m_Samples.empty()) {
+            m_SourceRelativeMissQuantileUs = 0;
             m_SourceRelativeQuantileUs = m_Stats.rawRequiredQuantileUs = 0;
             m_Stats.headroomTargetUnclippedUs = 0;
             m_Stats.validPairCoverageUs = 0;
@@ -385,29 +601,46 @@ private:
         }
         const uint64_t tail = 1000000 - probabilityPpm;
         const uint64_t needed = (1000000 + tail - 1) / tail;
+        const bool belowMissGoal = m_Stats.recentEligible &&
+            m_Stats.recentMissed * 1000000 > m_Stats.recentEligible * tail;
         // Learning protects each new maximum at once, so it is not throttled;
         // the history is still short (below the tail's supporting samples).
         if (m_Learning || removedSamples || !m_LastEvaluationUs || m_Samples.size() == needed ||
+            (m_HitchMissesOnly >= 2 && missDemandUs) ||
             atUs - m_LastEvaluationUs >= 100000 ||
             m_EvaluatedProbabilityPpm != probabilityPpm || m_EvaluatedWindowUs != windowUs) {
             m_LastEvaluationUs = atUs;
             m_EvaluatedProbabilityPpm = probabilityPpm;
             m_EvaluatedWindowUs = windowUs;
-            std::vector<int64_t> values;
+            std::vector<int64_t> values, missedValues;
             values.reserve(m_Samples.size());
+            if (m_HitchMissesOnly >= 2 && belowMissGoal) missedValues.reserve(m_Stats.recentMissed);
             m_Stats.validPairCoverageUs = 0;
             for (size_t i = 0; i < m_Samples.size(); ++i) {
                 const auto& sample = m_Samples[i];
                 values.push_back(sample.required);
+                if (m_HitchMissesOnly >= 2 && belowMissGoal && sample.missed && !sample.seed)
+                    missedValues.push_back(sample.required);
                 if (i && sample.epoch == m_Samples[i - 1].epoch)
                     m_Stats.validPairCoverageUs += sample.slot - m_Samples[i - 1].slot;
             }
             // One expected tail observation is support, not a confidence bound.
             m_Stats.tailUncertain = values.size() < needed || m_Stats.historyTruncated;
-            const size_t rank = m_Stats.tailUncertain ? values.size() :
+            const size_t rank = m_Stats.tailUncertain ?
+                values.size() - std::min(m_LearningTrim, values.size() - 1) :
                 size_t((probabilityPpm * values.size() + 999999) / 1000000);
             std::nth_element(values.begin(), values.begin() + rank - 1, values.end());
             m_SourceRelativeQuantileUs = values[rank - 1];
+            m_SourceRelativeMissQuantileUs = 0;
+            if (!missedValues.empty()) {
+                // Leave only the profile's permitted tail unprotected. Unlike
+                // the raw-input learning quantile, proven playback misses must
+                // not be trimmed away or replaced by harmless late inputs.
+                const size_t allowed = size_t(m_Stats.recentEligible * tail / 1000000);
+                const size_t missRank = missedValues.size() - std::min(allowed, missedValues.size() - 1);
+                std::nth_element(missedValues.begin(), missedValues.begin() + missRank - 1, missedValues.end());
+                m_SourceRelativeMissQuantileUs = missedValues[missRank - 1];
+            }
         }
         // Retained requirements use an immutable RTP/source coordinate. Only
         // this projection into the current local clock changes with mapping.
@@ -419,10 +652,59 @@ private:
         const uint64_t required = m_Stats.rawRequiredQuantileUs > budget ?
             uint64_t(m_Stats.rawRequiredQuantileUs) - uint64_t(budget) : 0;
         const uint64_t excess = required - std::min(required, m_Stats.toleranceUs);
-        const uint64_t requested = excess - std::min(excess, m_Stats.vrrHeadroomUs);
+        // Credit unused physical recovery room while the actual miss goal is
+        // met, including on slower rate layers. Once preventable hitches put
+        // it below goal, that room did not prevent them and cannot discount
+        // the protection needed to cover their input tail.
+        const uint64_t credit = m_HitchMissesOnly == 9 || (m_HitchMissesOnly && belowMissGoal) ?
+            0 : m_Stats.vrrHeadroomUs;
+        uint64_t requested = excess - std::min(excess, credit);
+        if (m_HitchMissesOnly >= 2 && belowMissGoal) {
+            const int64_t missRequired = offsetDifference(m_SourceRelativeMissQuantileUs, m_Stats.clockOffsetUs);
+            const uint64_t missDemand = missRequired > budget ? uint64_t(missRequired) - uint64_t(budget) : 0;
+            const uint64_t protection = missDemand - std::min(missDemand, m_Stats.toleranceUs);
+            requested = std::max(requested, protection);
+        }
         m_Stats.headroomTargetUnclippedUs = requested;
         m_Stats.targetUs = std::clamp(requested, m_Stats.minimumUs, m_Stats.maximumUs);
         m_Stats.clipped = requested > m_Stats.maximumUs;
+        // The quantile sizes protection, but only actual preventable hitches
+        // below the selected goal authorize an increase. Raw lateness on clean
+        // intervals cannot buy latency, including during initial learning.
+        if (m_HitchMissesOnly && !belowMissGoal) {
+            // Recovery of the historical percentage cannot revoke a growth
+            // request that an actual hitch already justified. A lower measured
+            // requirement can still reduce that request.
+            const uint64_t authorized = m_HitchMissesOnly >= 9 && m_Stats.recentReleaseMisses ?
+                std::max(m_Stats.currentUs, previousTargetUs) : m_Stats.currentUs;
+            m_Stats.targetUs = std::min(m_Stats.targetUs, authorized);
+            if (m_HitchMissesOnly != 9 && canProbeRelease()) {
+                // A raw late-input quantile is not proof that this protection
+                // remains necessary. Try a small reduction while actual input
+                // hitch coverage is healthy; fresh misses stop the probe.
+                const uint64_t probe = std::min<uint64_t>(100, m_Stats.toleranceUs / 4);
+                const uint64_t candidate = m_Stats.currentUs -
+                    std::min(probe, m_Stats.currentUs - m_Stats.minimumUs);
+                m_Stats.targetUs = std::min(m_Stats.targetUs, candidate);
+            }
+        }
+        else if (m_HitchMissesOnly) {
+            // Clean inputs cannot enlarge a previously justified request just
+            // because older misses still leave the history below goal. Only
+            // this actual miss may raise it, and only to its measured demand.
+            m_Stats.targetUs = std::min(m_Stats.targetUs,
+                std::max(previousTargetUs, missDemandUs));
+        }
+        if (m_HitchMissesOnly >= 9) {
+            if (m_LayerTransitionActive) {
+                if (m_LayerTransitionTargetUs < m_Stats.currentUs)
+                    m_LayerTransitionTargetUs = std::min(m_LayerTransitionTargetUs, m_Stats.targetUs);
+                m_Stats.targetUs = std::clamp(m_LayerTransitionTargetUs, m_Stats.minimumUs, m_Stats.maximumUs);
+            }
+            else if (m_HitchMissesOnly == 9) applyFeedbackBoundedRelease(atUs,
+                    std::clamp(requested, m_Stats.minimumUs, m_Stats.maximumUs));
+            if (m_HitchMissesOnly == 9) updateReleaseRate(m_Stats.recentReleaseMisses);
+        }
     }
     void move(uint64_t elapsed, bool growthAllowed) {
         const int direction = m_Stats.targetUs > m_Stats.currentUs ? 1 :
@@ -431,9 +713,21 @@ private:
         m_Direction = direction;
         m_Stats.growthBlocked = direction > 0 && !growthAllowed;
         if (!direction || (direction > 0 && !growthAllowed)) return;
+        if (direction < 0 && m_RateDropDrain &&
+            m_Stats.currentUs - m_Stats.targetUs > m_Stats.toleranceUs) m_RateDropFastDrain = true;
+        if (direction < 0 && m_HitchMissesOnly == 9 && fastLayerDrain()) {
+            const uint64_t movement = std::min(m_LayerDrainStepRemainingUs,
+                m_Stats.currentUs - m_Stats.targetUs);
+            m_LayerDrainStepRemainingUs -= movement;
+            m_Stats.currentUs -= movement;
+            if (movement) ++m_Stats.lowers;
+            if (m_Stats.currentUs == m_Stats.targetUs) m_LayerTransitionActive = false;
+            m_ReleaseFraction = 0;
+            return;
+        }
         // Preserve fractional soft rates (e.g. 37.5 us/s). Both products are
         // bounded: elapsed <= 100 ms, rate <= 1e6, factor <= 1e6.
-        const uint64_t rate = direction > 0 ? m_RiseRate : m_FallRate;
+        const uint64_t rate = direction > 0 ? m_RiseRate : m_Stats.effectiveFallRateUsPerSecond;
         constexpr uint64_t FractionDenominator = 1000000000000ULL;
         if (direction < 0) {
             // Assess the unattenuated next step before spending protection.
@@ -454,7 +748,13 @@ private:
             m_Stats.currentUs += movement;
             if (movement) ++m_Stats.raises;
         } else {
-            const uint64_t movement = std::min(step, m_Stats.currentUs - m_Stats.targetUs);
+            uint64_t movement = std::min(step, m_Stats.currentUs - m_Stats.targetUs);
+            if (canProbeRelease()) {
+                // advance() and observe() share one interval's allowance. A
+                // late decision or repeated calls cannot spend it twice.
+                movement = std::min(movement, m_ReleaseStepRemainingUs);
+                m_ReleaseStepRemainingUs -= movement;
+            }
             const uint64_t candidate = m_Stats.currentUs - movement;
             m_Stats.currentUs = candidate;
             if (movement) {
@@ -462,8 +762,18 @@ private:
                 if (m_Stats.expiredUnknown) ++m_Stats.unknownRelease;
             }
         }
+        if (m_LayerTransitionActive && m_Stats.currentUs == m_Stats.targetUs)
+            m_LayerTransitionActive = false;
     }
-    int64_t m_SourceRelativeQuantileUs = 0;
+    int64_t m_SourceRelativeQuantileUs = 0, m_SourceRelativeMissQuantileUs = 0;
+    bool m_StableAdaptation = false;
+    uint64_t m_ReleaseIntervalUs = 0;
+    uint64_t m_ReleaseStepRemainingUs = 0;
+    uint64_t m_ReleaseTrialFloorUs = 0, m_ReleaseTrialAtUs = 0, m_ReleaseTrialEligible = 0;
+    bool m_ReleaseTrialActive = false, m_ReleaseTrialWaiting = false, m_EvidenceBackedRelease = false;
+    uint64_t m_LayerTransitionTargetUs = 0, m_LayerDrainStepRemainingUs = 0;
+    bool m_LayerTransitionActive = false, m_LayerFastDrain = false;
+    bool m_RateDropDrain = false, m_RateDropFastDrain = false;
     struct Sample { uint64_t at, slot; int64_t required; uint64_t epoch; bool absorbed, missed; bool seed = false; };
     std::deque<Sample> m_Samples;
     Stats m_Stats;
@@ -474,6 +784,15 @@ private:
     uint64_t m_EvaluatedProbabilityPpm = 0, m_EvaluatedWindowUs = 0, m_ReleaseFraction = 0;
     bool m_PreviousValid = false;
     bool m_Learning = true;
+    // 0: historical raw input; 1: historical hitch gate; 2: retain the
+    // protection justified by qualifying misses while below the goal;
+    // 3: also project retained protection with its source-clock coordinate.
+    // 4: forward projection additionally requires measured coverage at goal;
+    // the caller limits this policy to rate-rise settling and uses 2 elsewhere.
+    // 5/6: the caller projects the actual live mapping separately; history's
+    // drift-normalized coordinate never directly moves applied protection.
+    uint64_t m_HitchMissesOnly = 0;
+    size_t m_LearningTrim = 0;
     int m_Direction = 0;
 };
 }

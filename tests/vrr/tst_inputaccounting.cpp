@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <limits>
 #include <random>
+#include <utility>
 using Vrr13::InputPercentileBuffer;
 int fail=0;
 void check(bool b,const char* msg){if(!b){std::fprintf(stderr,"FAIL: %s\n",msg);++fail;}}
@@ -12,6 +13,10 @@ void rateRoundTrip() {
  cfg.experimentalInputPercentilePpm=1;cfg.experimentalBoundedCatchup=true;
  cfg.smoothFrameTiming=false;cfg.timingOptions={4000,9995,300,500};
  auto policy=vrrTimingParametersForSession(cfg);policy.playoutDelayStartSeedUs=1000;
+ // Keep the recorded raw-input outcome definition in this clock/accounting
+ // comparison. Actual preventable-hitch scoring is exercised independently by
+ // tst_inputpercentileintegration, including the production rate-layer path.
+ policy.playoutInputHitchMissesOnly=0;policy.playoutInputStableAdaptation=0;
  VrrTimingController c(cfg,true,policy);uint64_t slot=1000000,pts=0,submitted=0,frame=0;
  const auto feed=[&](uint64_t count,uint64_t period,uint32_t ticks,uint64_t spike) {
   for(uint64_t n=0;n<count;++n,++frame) {
@@ -39,6 +44,10 @@ DriftRun driftRun(bool correct,double ppm,bool sparseEarly=false) {
  cfg.experimentalInputPercentilePpm=1;cfg.experimentalBoundedCatchup=true;cfg.correctInputAccounting=correct;
  cfg.smoothFrameTiming=false;cfg.timingOptions={4000,9995,300,500};
  auto policy=vrrTimingParametersForSession(cfg);policy.playoutDelayStartSeedUs=1000;
+ // Keep the recorded raw-input outcome definition in this clock/accounting
+ // comparison. Actual preventable-hitch scoring is exercised independently by
+ // tst_inputpercentileintegration, including the production rate-layer path.
+ policy.playoutInputHitchMissesOnly=0;policy.playoutInputStableAdaptation=0;
  VrrTimingController c(cfg,true,policy);double slot=1000000;uint64_t submitted=0;uint32_t pts=0;
  std::mt19937_64 rng(42);std::gamma_distribution<double> jitter(2.0,400.0);std::uniform_real_distribution<double> spike(0,1);
  double sum=0;uint64_t counted=0;
@@ -77,21 +86,25 @@ struct DropRun{double latencyUs;uint64_t missed,eligible;};
 // minimum sits below the typical frame and the buffer covers the gap. The
 // source then drops abruptly to 30 FPS without early frames: the mapping slews
 // 8 ms later over seconds and the evidence needs 8 ms less buffer.
-DropRun rateDropRun(bool follow) {
+DropRun rateDropRun(bool follow,uint64_t version=6) {
  VrrSessionConfig cfg;cfg.streamRateHz=116;cfg.displayRefreshHz=120;
  cfg.experimentalInputPercentilePpm=1;cfg.experimentalBoundedCatchup=true;
  cfg.smoothFrameTiming=false;cfg.timingOptions={4000,9995,300,500};
  auto policy=vrrTimingParametersForSession(cfg);policy.playoutDelayStartSeedUs=1000;
- policy.playoutInputRateDropSnap=follow;
+ policy.playoutInputHitchMissesOnly=version;policy.playoutInputStableAdaptation=version>=10;
+ policy.playoutInputRateDropSnap=follow;policy.playoutInputBoundedRecoveryCredit=1;
  VrrTimingController c(cfg,true,policy);uint64_t slot=1000000,submitted=0,frame=0;uint32_t pts=0;
  std::mt19937_64 rng(7);std::uniform_int_distribution<uint64_t> jitter(0,600);
- double latency=0;uint64_t counted=0;
+ double latency=0;uint64_t counted=0,previousBuffer=0;
  const auto feed=[&](uint64_t count,uint64_t period,uint32_t ticks,bool earlyFrames,bool measure) {
   for(uint64_t n=0;n<count;++n,++frame) {
    slot+=period;pts+=ticks;
    const uint64_t ready=slot+(earlyFrames&&frame%10==0?1000:9000)+jitter(rng);
    PacedFrame f(nullptr,int(frame),pts,true,ready);f.setDeliveryTimeline(ready-800,ready-600,ready-500);
    const auto d=c.schedule(f,std::max(ready,submitted));
+   if(version>=9 && previousBuffer>d.playoutDelayUs)
+    check(previousBuffer-d.playoutDelayUs<=500,"actual layer drain never removes more than T in one frame");
+   previousBuffer=d.playoutDelayUs;
    const uint64_t prepared=std::max(ready,d.renderStartUs)+500;
    submitted=std::max(prepared,d.targetUs);c.notePreparationDuration(500,0,prepared);
    c.noteSchedulerDelays(0,0,true);c.noteSubmission(true,false,submitted,submitted);
@@ -109,15 +122,36 @@ void rateDropFollow() {
  std::printf("116->30 drop, first 15 s: drain %.0f us ready-to-present %llu/%llu misses, follow %.0f us %llu/%llu misses\n",drain.latencyUs,(unsigned long long)drain.missed,(unsigned long long)drain.eligible,follow.latencyUs,(unsigned long long)follow.missed,(unsigned long long)follow.eligible);
  check(follow.latencyUs+3000<=drain.latencyUs,"an abrupt rate drop gives back the mapping's movement at once");
  check(follow.missed<=drain.missed+2,"following the target through a rate drop keeps coverage");
+ const auto fast=rateDropRun(false,7);
+ check(fast.latencyUs<=follow.latencyUs+500 && fast.missed<=follow.missed+2,
+       "fast layers and gradual release avoid old transition retention even without the snap shortcut");
+ const auto confirmed=rateDropRun(true,8);
+ check(confirmed.latencyUs<=follow.latencyUs+500 && confirmed.missed<=follow.missed+2,
+       "confirmed layers keep prompt low-rate recovery without repeated target snapping");
+ const auto toleranceLimited=rateDropRun(true,9);
+ std::printf("T-limited 116->30: %.0f us ready-to-present %llu/%llu misses; snap reference %.0f us %llu/%llu\n",
+       toleranceLimited.latencyUs,(unsigned long long)toleranceLimited.missed,(unsigned long long)toleranceLimited.eligible,
+       follow.latencyUs,(unsigned long long)follow.missed,(unsigned long long)follow.eligible);
+ check(toleranceLimited.latencyUs<=follow.latencyUs+500 && toleranceLimited.missed<=follow.missed+2,
+       "T-per-frame layer draining retains prompt low-rate recovery without an instant downward step");
 }
 int main(){
  VrrSessionConfig cfg;cfg.streamRateHz=76;cfg.displayRefreshHz=120;cfg.latencyMode=0;cfg.experimentalInputPercentilePpm=1;cfg.experimentalBoundedCatchup=true;cfg.timingOptions={4000,9995,300,500};
  auto p=vrrTimingParametersForSession(cfg);VrrTimingController c(cfg,true,p);
- check(p.playoutInputClockRelativeHistory==3&&p.playoutInputBoundedRecoveryCredit==1&&p.playoutInputRateDropSnap==1,"current main enables corrected accounting");
- check(c.recoveryHeadroomUs()>4800&&c.inputRecoveryCreditUs()==500,"large physical gap grants only configured recovery allowance");
+ check(p.playoutInputHitchMissesOnly==10,"new sessions use fast rate layers while historical clock comparisons remain explicit");
+ check(p.playoutInputClockRelativeHistory==3&&p.playoutInputBoundedRecoveryCredit==0&&p.playoutInputRateDropSnap==1&&
+       p.playoutInputLayerSeedRatioPerMille==1500&&p.playoutInputLearningTrim==1,"current main enables corrected accounting with physical recovery credit");
+ check(p.playoutInputRecoveryCreditRoomPerMille==50&&c.recoveryHeadroomUs()>4800&&
+       c.inputRecoveryCreditUs()+1>=c.recoveryHeadroomUs()/20&&c.inputRecoveryCreditUs()<=c.recoveryHeadroomUs()/20+1,"Smooth credits a twentieth of the physical VRR room");
+ for(const auto& [target,share]:{std::pair<int,uint64_t>{9900,1000},{9950,500},{9995,50},{9000,1000}}){
+  VrrSessionConfig scaled=cfg;scaled.timingOptions.targetHundredths=target;
+  check(vrrTimingParametersForSession(scaled).playoutInputRecoveryCreditRoomPerMille==share,"credit scales with the profile's miss allowance");
+ }
+ auto bounded=p;bounded.playoutInputBoundedRecoveryCredit=1;VrrTimingController cb(cfg,true,bounded);
+ check(cb.recoveryHeadroomUs()>4800&&cb.inputRecoveryCreditUs()==500,"bounded credit grants only the configured recovery allowance");
  cfg.correctInputAccounting=false;auto old=vrrTimingParametersForSession(cfg);VrrTimingController legacy(cfg,true,old);check(legacy.inputRecoveryCreditUs()==legacy.recoveryHeadroomUs(),"diagnostic legacy control retains original credit");
  check(p.playoutInputPercentileTargetPerMillion==999500&&p.playoutInputPercentileWindowUs==300000000&&p.playoutInputPercentileToleranceUs==500,"active 99.95/300s/0.50ms profile preserved");
- cfg.correctInputAccounting=true;cfg.streamRateHz=116;VrrTimingController high(cfg,true,vrrTimingParametersForSession(cfg));check(high.inputRecoveryCreditUs()==high.recoveryHeadroomUs()&&high.inputRecoveryCreditUs()<500,"near-ceiling physical room retained without over-credit");
+ cfg.correctInputAccounting=true;cfg.streamRateHz=116;VrrTimingController high(cfg,true,vrrTimingParametersForSession(cfg));check(high.inputRecoveryCreditUs()<=high.recoveryHeadroomUs()&&high.inputRecoveryCreditUs()<500,"near-ceiling physical room retained without over-credit");
  InputPercentileBuffer a,b;a.reset(1000);b.reset(1000);
  for(uint64_t f=1;f<=2500;++f){observe(a,f,5000,100000);observe(b,f,5000,7000000);}check(a.stats().targetUs==4000&&a.stats().targetUs==b.stats().targetUs,"clock origin invariant, tolerance and recovery credit subtracted once");
  const auto historic=a.stats().missed;

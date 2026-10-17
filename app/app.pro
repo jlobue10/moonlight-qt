@@ -335,6 +335,9 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/pacer/vrr/readinessfeedback.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/smoothnessfeedback.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/inputlayercadence.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/inputcoveragehistory.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/extrabufferslew.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/sourcegapsmoothing.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrframedroppolicy.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrcatchup.h \

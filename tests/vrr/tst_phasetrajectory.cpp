@@ -72,6 +72,55 @@ void compressionAndAcceptance() {
     check(late.carryUs>=6690-250-200 && late.carryUs<=6690+200,
         "lateness beyond the usual overshoot is carried, minus one drain step");
 }
+void carryRepaymentKnobs() {
+    // 6690us carry before a 9719us intended successor, 750us allowance.
+    const auto planWith=[](uint64_t limit) {
+        Vrr13::PhaseTrajectory p;p.commit(1,100000,106690,106690,true,false,true);
+        return p.plan(2,109719,109719,109719,109719,8333,115023,750,9719,true,limit);
+    };
+    check(planWith(0).targetUs==116200,"no carry limit keeps the 1/32 repayment");
+    check(planWith(8000).targetUs==116200,"a carry limit above the carry changes nothing");
+    const auto capped=planWith(2000);
+    check(capped.targetUs==115023 && capped.capped==1,"a carry limit falls back to the physical ownership floor");
+}
+
+void extraDelayDoesNotChaseCurrentReadiness() {
+    Vrr13::PhaseTrajectory p;
+    p.plan(1,100000,100000,100000,100000,8333,0,500,10000,true,4000);
+    p.commit(1,100000,104000,104000,true,false,true);
+    uint64_t expectedExtra=0,previousMarginal=0;bool marginalChanged=false;
+    for(uint64_t readyExtra:{0ULL,1000ULL,3000ULL,7000ULL}) {
+        const auto s=p.plan(2,110000,110000,110000+readyExtra,110000+readyExtra,
+                            8333,0,500,10000,true,4000);
+        VrrTimingDecision d;d.originalTargetUs=110000;
+        d.requestedPhaseTargetUs=s.requestedTargetUs;d.cadenceSmoothingUs=713;d.trajectory=s;
+        const auto extra=d.plannedExtraDelayUs();
+        if(!expectedExtra) expectedExtra=extra;
+        check(extra==expectedExtra && extra==4588,
+              "the same retained recovery phase reports the same extra despite alternating current readiness");
+        check(s.targetUs==std::max(s.requestedTargetUs,110000+readyExtra),
+              "extra accounting preserves the actual readiness-bounded target");
+        marginalChanged|=previousMarginal && previousMarginal!=s.addedUs;
+        previousMarginal=s.addedUs;
+    }
+    check(marginalChanged,"fixture reproduces the old marginal-wait reporting oscillation");
+    Vrr13::PhaseTrajectory first;
+    VrrTimingDecision d;d.originalTargetUs=100000;d.requestedPhaseTargetUs=100000;
+    d.trajectory=first.plan(1,100000,100000,113000,113000,8333,0,500,10000,true,4000);
+    check(d.plannedExtraDelayUs()==0 && d.trajectory.targetUs==113000,
+          "a new late input stays a readiness overrun, not invented smoothing/recovery protection");
+    d.requestedPhaseTargetUs=102000;
+    check(d.plannedExtraDelayUs()==2000,"a requested physical floor remains visible independently of current readiness");
+    d.cadenceSmoothingUs=-2500;
+    check(d.plannedExtraDelayUs()==0,"negative smoothing cancels requested phase before the nonnegative clamp");
+    d.trajectory={};d.originalTargetUs=0;d.requestedPhaseTargetUs=std::numeric_limits<uint64_t>::max();
+    d.cadenceSmoothingUs=1;
+    check(d.plannedExtraDelayUs()==std::numeric_limits<uint64_t>::max(),"extra arithmetic saturates without wrapping");
+    d.requestedPhaseTargetUs=0;
+    d.cadenceSmoothingUs=std::numeric_limits<int64_t>::min();
+    check(d.plannedExtraDelayUs()==0,"the most negative phase clamps safely");
+}
+
 void decodeCompletionEstimate() {
     using C=VrrTimingController;
     check(C::estimateDecodeCompleteUs(1000,5000,3000,3800)==5000,"worker blocked on decode: its completion time is exact");
@@ -201,11 +250,14 @@ void legacyRecoveryCannotSustainCarry() {
     VrrSessionConfig session;session.streamRateHz=116;session.displayRefreshHz=120;
     session.smoothFrameTiming=false;session.experimentalInputPercentilePpm=1;session.experimentalBoundedCatchup=true;
     session.timingOptions.targetHundredths=9950;session.timingOptions.historySeconds=200;
+    for(bool hitchOnly:{false,true}) {
     auto policy=vrrTimingParametersForSession(session);
+    policy.playoutInputHitchMissesOnly=hitchOnly;
     policy.playoutDelayMinimumUs=1000;policy.playoutDelayStartSeedUs=1000;policy.playoutDelayMaximumUs=1000;
     VrrTimingController c(session,true,policy);
     const uint64_t period=1000000/116;
     std::vector<uint64_t> carry,pushed;
+    uint64_t tailFrames=0,tailStillPushed=0;
     for(int i=0;i<2400;++i) {
         const uint64_t source=1000000+uint64_t(i)*period;
         const uint64_t decoded=source+500+(i%200==100?6000:0);
@@ -213,6 +265,10 @@ void legacyRecoveryCannotSustainCarry() {
         f.setDeliveryTimeline(decoded-800,decoded-600,decoded-500);
         const auto d=c.schedule(f,decoded);
         if(i>=1200) {carry.push_back(d.trajectory.carryUs);pushed.push_back(d.targetUs-d.originalTargetUs);}
+        if(i>=1200 && i%200>=180) {
+            ++tailFrames;
+            tailStillPushed+=d.trajectory.carryUs!=0 || d.targetUs!=d.originalTargetUs;
+        }
         const uint64_t ready=std::max(decoded,d.renderStartUs)+500;
         const uint64_t submission=std::max(ready,d.targetUs)+280;
         c.notePreparationDuration(500,0,ready);c.noteSchedulerDelays(0,0,true);c.noteSubmission(true,false,submission,submission);
@@ -220,10 +276,21 @@ void legacyRecoveryCannotSustainCarry() {
     std::sort(carry.begin(),carry.end());std::sort(pushed.begin(),pushed.end());
     const auto median=[](const std::vector<uint64_t>& v){return v[v.size()/2];};
     const auto p90=[](const std::vector<uint64_t>& v){return v[v.size()*9/10];};
-    std::fprintf(stderr,"legacy recovery with bounded catch-up: carry p50 %lluus p90 %lluus; target-plan p50 %lluus p90 %lluus\n",
-        (unsigned long long)median(carry),(unsigned long long)p90(carry),(unsigned long long)median(pushed),(unsigned long long)p90(pushed));
+    std::fprintf(stderr,"legacy recovery with bounded catch-up (%s): carry p50 %lluus p90 %lluus; target-plan p50 %lluus p90 %lluus\n",
+        hitchOnly?"preventable misses":"recorded input coverage",(unsigned long long)median(carry),(unsigned long long)p90(carry),(unsigned long long)median(pushed),(unsigned long long)p90(pushed));
     check(median(carry)==0 && median(pushed)==0,"between late frames the schedule returns to its plan");
-    check(p90(carry)<1000,"carry from a 6 ms late frame drains instead of being re-imposed frame after frame");
+    if(!hitchOnly) check(p90(carry)<1000,
+        "recorded input coverage retains the original recovery regression bound");
+    else {
+        // A 6 ms input spike exceeds this session's permitted buffer. The
+        // new goal does not buy extra buffer for it; test actual catch-up
+        // convergence instead of relying on the old adaptive-buffer growth.
+        check(tailFrames>0 && tailStillPushed==0,
+            "unpreventable late frames still drain all carry before the next spike without re-imposing the hold");
+        check(p90(carry)<=policy.playoutCatchupCarryLimitUs,
+            "miss-only scoring retains the selected catch-up carry ceiling");
+    }
+    }
 }
 void actualCadenceChangeQualification() {
     VrrSessionConfig session;session.streamRateHz=120;session.displayRefreshHz=144;session.smoothFrameTiming=false;
@@ -289,4 +356,4 @@ void actualControllerAndInputIsolation() {
     late.reset();check(late.trajectoryStats().plans==0,"controller full reset clears trajectory model");
 }
 }
-int main() {decodeCompletionEstimate();legacyRecoveryCannotSustainCarry();asyncDecodeCompletionPlanning();compressionAndAcceptance();resyncAndLifecycle();preparedSuccessorProof();sourceMappingFactorial();actualCadenceChangeQualification();actualControllerAndInputIsolation();std::fprintf(stderr,"phase trajectory integration: %s (%d failures)\n",failures?"FAIL":"PASS",failures);return failures?1:0;}
+int main() {extraDelayDoesNotChaseCurrentReadiness();carryRepaymentKnobs();decodeCompletionEstimate();legacyRecoveryCannotSustainCarry();asyncDecodeCompletionPlanning();compressionAndAcceptance();resyncAndLifecycle();preparedSuccessorProof();sourceMappingFactorial();actualCadenceChangeQualification();actualControllerAndInputIsolation();std::fprintf(stderr,"phase trajectory integration: %s (%d failures)\n",failures?"FAIL":"PASS",failures);return failures?1:0;}

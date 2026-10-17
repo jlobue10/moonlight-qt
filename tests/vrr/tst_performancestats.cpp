@@ -22,10 +22,21 @@ int main(int argc, char** argv)
     s.present.lastObservedUs = s.nowUs = 10000000;
     auto text = formatVrr(s);
     // Each current value shares one line with its target.
-    assert(has(text, "VRR buffer: 5.70 ms (target 5.42 ms) | coverage 99.95% / 99.95% target\n"));
+    assert(has(text, "VRR buffer: 5.70 ms (target 5.42) | coverage 99.95% / 99.95% target\n"));
     assert(has(text, "Present timing issues (30s): 1.00% >0.50 ms | hitches 1 | worst +4.2 ms\n"));
-    assert(std::count(text.begin(), text.end(), '\n') == 2);
+    assert(has(text, "Extra delay: 0.00 ms (smoothing/recovery) | Planned total: 5.70 ms\n"));
+    assert(std::count(text.begin(), text.end(), '\n') == 3);
     if (argc > 1 && std::string(argv[1]) == "--fixture") { std::cout << text; return 0; }
+
+    // A short reporting window responds independently of the profile history.
+    s.input.reportingWindowUs=10000000;s.input.reportingEligible=1000;
+    s.input.reportingMissed=0;
+    assert(has(formatVrr(s), "coverage (10s) 100.00% / 99.95% | 300s 99.95%"));
+    s.input.reportingMissed=2;
+    assert(has(formatVrr(s), "coverage (10s) 99.80% / 99.95% | 300s 99.95%"));
+    s.input.reportingEligible=0;
+    assert(has(formatVrr(s), "coverage (10s) N/A / 99.95% | 300s 99.95%"));
+    s.input.reportingWindowUs=0;
 
     // A legitimate measured zero differs from missing or stale feedback.
     s.present.misses = 0;
@@ -35,11 +46,25 @@ int main(int argc, char** argv)
     s.present.lastPausedUs = s.nowUs;
     assert(has(formatVrr(s), "Present timing issues (30s): paused below VRR range"));
     s.input.tailUncertain = true;
-    assert(has(formatVrr(s), "VRR buffer: 5.70 ms (target 5.42 ms learning) | "));
+    assert(has(formatVrr(s), "VRR buffer: 5.70 ms (target 5.42 learning) | "));
+    // Smoothing can vary while the graph's input buffer stays fixed. Keep
+    // the leading buffer value stable, with the extra delay and total explicit.
+    s.smoothingUs = 1250;
+    assert(has(formatVrr(s), "VRR buffer: 5.70 ms (target 5.42 learning) | "));
+    assert(has(formatVrr(s), "Extra delay: 1.25 ms (smoothing/recovery) | Planned total: 6.95 ms\n"));
+    s.bufferUs = 3000;
+    for (const uint64_t smoothing : {0, 3000, 0, 3000}) {
+        s.smoothingUs = smoothing;
+        const auto value = formatVrr(s);
+        assert(has(value, "VRR buffer: 3.00 ms ("));
+        assert(has(value, smoothing ? "Extra delay: 3.00 ms (smoothing/recovery) | Planned total: 6.00 ms" : "Extra delay: 0.00 ms (smoothing/recovery) | Planned total: 3.00 ms"));
+    }
+    s.bufferUs = 5700;
+    s.smoothingUs = 0;
     s.input.recentEligible = 0;
     assert(has(formatVrr(s), "| coverage N/A / 99.95% target\n"));
     s.atLimit = true;
-    assert(has(formatVrr(s), "VRR buffer: 5.70 ms at limit (target 5.42 ms learning) | "));
+    assert(has(formatVrr(s), "VRR buffer: 5.70 ms at limit (target 5.42 learning) | "));
     // Revision-12 buffer: the client timing score takes coverage's place.
     s.adaptive = false; s.atLimit = false;
     assert(has(formatVrr(s), "VRR buffer: 5.70 ms | client timing collecting / 99.95% target\n"));
