@@ -621,7 +621,9 @@ uint64_t SteamControllerLink::service(uint64_t nowMs)
             m_DrainBusy = true;
             lock.unlock();
             // Host settings are feature report 1 frames (SET_REPORT), haptics output reports.
+            const uint64_t writeStartMs = SteamController::nowMs();
             bool success = settings ? sendFeature(report) : writeOutput(report);
+            const uint64_t writeTookMs = SteamController::nowMs() - writeStartMs;
             lock.lock();
             m_DrainBusy = false;
             if (m_Stopped) return NEVER;
@@ -631,6 +633,7 @@ uint64_t SteamControllerLink::service(uint64_t nowMs)
             else {
                 m_SummaryWriteFailures++;
             }
+            if (!settings) logWriteLocked(report, success, writeTookMs);
             // A disconnect may have queued work for a new controller while this transfer was in
             // flight. Its queue and failure budget belong to it.
             if (m_Generation == generation) {
@@ -712,6 +715,21 @@ void SteamControllerLink::logHostReportLocked(const uint8_t* report, int length,
     }
     logf(LogInfo, "Steam Controller %s: host haptic report #%u at +%llu ms: %s",
          m_Name.c_str(), ++m_HostSamplesLogged, (unsigned long long)(nowMs - m_FirstHostReportMs), hex);
+}
+
+void SteamControllerLink::logWriteLocked(const std::vector<uint8_t>& report, bool success, uint64_t tookMs)
+{
+    // The write-side counterpart of the host samples: pulses and commands only, with how long
+    // the transport took (a blocked hidraw or GATT write shows here) and whether it completed.
+    if (report.empty() || report[0] == OUT_RUMBLE || m_WriteSamplesLogged >= HOST_HAPTIC_SAMPLES) return;
+    char hex[3 * 16 + 1];
+    int n = 0;
+    for (size_t i = 0; i < report.size() && i < 16; i++) {
+        n += snprintf(hex + n, sizeof(hex) - n, "%s%02x", i ? " " : "", report[i]);
+    }
+    logf(LogInfo, "Steam Controller %s: wrote #%u %s in %llu ms: %s%s",
+         m_Name.c_str(), ++m_WriteSamplesLogged, hex, (unsigned long long)tookMs, success ? "ok" : "failed",
+         m_Outputs.size() > 1 ? " (more queued)" : "");
 }
 
 void SteamControllerLink::noteWrittenLocked(const std::vector<uint8_t>& report)

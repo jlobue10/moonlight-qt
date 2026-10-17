@@ -192,6 +192,7 @@ private:
     // link, and the per-side written counters the summary sets against what the host sent.
     void logHostReportLocked(const uint8_t* report, int length, uint64_t nowMs);
     void noteWrittenLocked(const std::vector<uint8_t>& report);
+    void logWriteLocked(const std::vector<uint8_t>& report, bool success, uint64_t tookMs);
 
     const int m_Id;
     const SteamHidDeviceInfo m_Info;
@@ -250,7 +251,7 @@ private:
     // the stream, "written" what completed on the link; a gap between them is this driver's
     // (eviction, write failure), none is the host's or the firmware's.
     static constexpr unsigned HOST_HAPTIC_SAMPLES = 40;
-    unsigned m_HostSamplesLogged = 0;
+    unsigned m_HostSamplesLogged = 0, m_WriteSamplesLogged = 0;
     uint64_t m_FirstHostReportMs = 0;
     unsigned m_SummaryStops = 0, m_SummaryEvicted = 0, m_SummaryWriteFailures = 0;
     unsigned m_SummaryWrittenRumble = 0, m_SummaryWrittenPulse[3] = {0, 0, 0}, m_SummaryWrittenCommand[3] = {0, 0, 0};
