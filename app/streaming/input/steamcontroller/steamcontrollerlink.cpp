@@ -690,9 +690,11 @@ uint64_t SteamControllerLink::logSummaryLocked(uint64_t nowMs)
         logf(LogInfo, "Steam Controller %s: %u reports/s, pads touched L %s R %s, host haptics: rumble %u, pulse L/R/both %u/%u/%u, command L/R/both %u/%u/%u, other %u (%u stops); written: rumble %u, pulse L/R/both %u/%u/%u, command L/R/both %u/%u/%u; write failures %u, evicted %u%s",
              m_Name.c_str(), (unsigned)(m_SummaryReports * 1000 / SUMMARY_MS),
              m_SummaryLeftPad ? "yes" : "no", m_SummaryRightPad ? "yes" : "no",
-             m_SummaryRumble, m_SummaryPulse[0], m_SummaryPulse[1], m_SummaryPulse[2],
+             // Measured side bytes (Android fork.114): a 0x81 pulse with side 0 lands on the right
+             // pad and side 1 on the left; a 0x82 command with side 0 on the left and side 1 on the right.
+             m_SummaryRumble, m_SummaryPulse[1], m_SummaryPulse[0], m_SummaryPulse[2],
              m_SummaryCommand[0], m_SummaryCommand[1], m_SummaryCommand[2], m_SummaryOther, m_SummaryStops,
-             m_SummaryWrittenRumble, m_SummaryWrittenPulse[0], m_SummaryWrittenPulse[1], m_SummaryWrittenPulse[2],
+             m_SummaryWrittenRumble, m_SummaryWrittenPulse[1], m_SummaryWrittenPulse[0], m_SummaryWrittenPulse[2],
              m_SummaryWrittenCommand[0], m_SummaryWrittenCommand[1], m_SummaryWrittenCommand[2],
              m_SummaryWriteFailures, m_SummaryEvicted, ble);
     }

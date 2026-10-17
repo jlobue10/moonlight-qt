@@ -232,9 +232,13 @@ Steam Controller Bluetooth LE slot 0: 133 reports/s, pads touched L yes R yes, h
 (`host haptics` is what Steam sent through the stream, `written` what completed on the link,
 `host settings` counts the relayed writes, `adjusted` the haptic reports rewritten by the
 Bluetooth LE knobs.) The first 40 host pulse and command reports of a link are also logged one
-by one, `host haptic report #n at +t ms: 82 00 02 f2` (side 0 = left pad, 1 = right, 2 = both;
-Steam's pad click is one `82 <side> 02 f2` click command at -14 dB, a finger sliding over a pad
-single 400 us pulses `81 <side> 90 01 00 00 01 00`, and `81 <side> 00 ..` a stop). A click that
+by one, `host haptic report #n at +t ms: 82 00 02 f2`, and the first 40 writes as `wrote #n
+.. in N ms: ok`. The side byte differs between the two report families (measured on the
+controller): a `0x82` command with side 0 is the left pad and 1 the right, a `0x81` pulse with
+side 0 is the right pad and 1 the left, 2 is both in either; the summary's L/R columns already
+account for that. Steam's pad click is one `82 <side> 02 f2` click command at -14 dB or, in
+some layouts, one 400 us pulse `81 <side> 90 01 00 00 01 00` (also its slide texture), and
+`81 <side> 00 ..` is a stop. A click that
 was felt on one pad but not the other reads off these lines: no `82 0x 02 f2` for it means the
 host did not generate it (the click bit never reached Steam, or Steam's per-controller haptic
 settings for the virtual unit); `host` and `written` apart means this driver lost it (`evicted`,
